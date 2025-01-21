@@ -1,0 +1,10 @@
+.ccls-cache/
+compile_commands.json
+
+# Xmake cache
+.xmake/
+build/
+
+# MacOS Cache
+.DS_Store
+
