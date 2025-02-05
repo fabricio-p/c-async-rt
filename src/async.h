@@ -37,13 +37,19 @@ typedef struct coroutine_t {
     CoroutineFunctionPtr fn;
     uint64_t id;
     uint64_t stage;
-    uintptr_t state;
+    size_t state : 32;
     CoroutineContext ctx;
 } Coroutine;
+
+enum {
+    CORO_DISCARD,
+    CORO_FREE
+};
 
 typedef struct coroutine_queue_node_t {
     Coroutine *coro;
     struct coroutine_queue_node_t *next;
+    size_t flags;
 } CoroutineQueue_Node;
 
 struct coroutine_queue_t {
@@ -52,7 +58,8 @@ struct coroutine_queue_t {
 };
 
 #define DEFINE_CORO(name)                                                   \
-    CoroutineResult name(                                                   \
+    CoroutineResult                                                         \
+    name(                                                                   \
         __attribute__((unused)) CoroutineContext *_coro_ctx_,               \
         __attribute__((unused)) CoroutineQueue *_coro_queue_,               \
         __attribute__((unused)) OpaqueMemory _coro_arg_,                    \
@@ -84,7 +91,8 @@ struct coroutine_queue_t {
 
 #define CORO_CUT_STAGE(stage_) } break; _CORO_CASE_(stage_) {
 
-#define CORO_STAGE(stage_) } __attribute__((fallthrough)); _CORO_CASE_(stage_) {
+#define CORO_STAGE(stage_)                                                  \
+    } __attribute__((fallthrough)); _CORO_CASE_(stage_) {
 
 #define CORO_YIELD(stage_)                                                  \
     return (CoroutineResult) {                                              \
@@ -107,30 +115,36 @@ struct coroutine_queue_t {
 #define CORO_END()                                                          \
     } break; } CORO_RETURN(0)
 
-#define CORO_EMPTY()                                                        \
-    return (CoroutineResult) { .state = CORO_DONE, .stage = 0 }
+#define CORO_EMPTY() CORO_DONE(0)
 
 #define CORO_RUN(coro_, fn, arg_)                                           \
     coro_init(coro_, fn, arg_);                                             \
     coro_queue_push_coro(_coro_queue_, coro_)
 
-#define CORO_AWAIT_BEGIN(stage_, coro_)                                     \
+#define CORO_AWAIT(stage_, coro_)                                           \
     CORO_STAGE(stage_);                                                     \
     if ((coro_)->state != CORO_DONE) { CORO_YIELD((stage_)); }
 
 void coro_context_init(CoroutineContext *ctx);
-void coro_context_cleanup(CoroutineContext *ctx);
+// void coro_context_cleanup(CoroutineContext *ctx);
 
 void coro_init(Coroutine *coro, CoroutineFunctionPtr fn, void *arg);
 CoroutineState coro_run(Coroutine *coro, CoroutineQueue *queue);
 void coro_cleanup(Coroutine *coro);
 
 
-CoroutineQueue_Node *coro_queue_node_new(Coroutine *coro);
+CoroutineQueue_Node *coro_queue_node_new(
+    Coroutine *coro,
+    size_t flags
+);
 void coro_queue_node_delete(CoroutineQueue_Node *coro);
 
 void coro_queue_init(CoroutineQueue *queue);
-void coro_queue_push_coro(CoroutineQueue *queue, Coroutine *coro);
+void coro_queue_push_coro(
+    CoroutineQueue *queue,
+    Coroutine *coro,
+    size_t flags
+);
 void coro_queue_push(CoroutineQueue *queue, CoroutineQueue_Node *node);
 CoroutineQueue_Node *coro_queue_pop(CoroutineQueue *queue);
 
