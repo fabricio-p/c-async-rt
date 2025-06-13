@@ -4,9 +4,9 @@ add_requires("liburing")
 
 target("async-rt")
    set_kind("static")
-   set_languages("c99")
+   set_languages("c11")
    set_warnings("all", "error", "extra", "pedantic")
-   add_files("src/async.c")
+   add_files("src/async.c", "src/ds.c")
 
 target("main")
    set_kind("binary")

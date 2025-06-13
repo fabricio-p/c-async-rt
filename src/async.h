@@ -1,157 +1,193 @@
-#ifndef CORO_H
-#define CORO_H
+#ifndef ART_CO_H
+#define ART_CO_H
 
 #include <stdlib.h>
+#include <pthread.h>
 #include <inttypes.h>
+#include "ds.h"
 
 typedef void *OpaqueMemory;
-typedef struct coroutine_queue_t CoroutineQueue;
+typedef struct art_context_t ARTContext;
+typedef struct art_scheduler_id_t ARTSchedulerID;
 
-typedef enum coroutine_state_t {
-    CORO_DONE,
-    CORO_INITIALIZED,
-    CORO_WAITING,
-    CORO_WAITING_IO,
-} CoroutineState;
+typedef enum coroutine_status_t {
+    ART_CO_DONE,
+    ART_CO_INITIALIZED,
+    ART_CO_WAITING,
+    ART_CO_WAITING_IO,
+} ARTCoroStatus;
 
 typedef struct coroutine_result_t {
-    CoroutineState state;
+    ARTCoroStatus status;
     uint64_t stage;
-} CoroutineResult;
+} ARTCoroResult;
 
-typedef struct coroutine_context_t {
+typedef struct coroutine_state_t {
     size_t r_size;
-    size_t state_size;
+    size_t data_size;
     OpaqueMemory ret;
-    OpaqueMemory state;
-} CoroutineContext;
+    OpaqueMemory data;
+} ARTCoroState;
 
-typedef CoroutineResult (*CoroutineFunctionPtr)(
-    CoroutineContext *ctx,
-    CoroutineQueue *queue,
+typedef ARTCoroResult (*ARTCoroFunctionPtr)(
+    ARTContext *ctx,
+    ARTCoroState *state,
     OpaqueMemory arg,
     uint64_t stage
 );
 
 typedef struct coroutine_t {
-    CoroutineFunctionPtr fn;
+    DOUBLE_LIST_PARTS(, struct coroutine_t);
+    size_t flags;
+
+    ARTCoroFunctionPtr fn;
     uint64_t id;
     uint64_t stage;
-    size_t state : 32;
-    CoroutineContext ctx;
-} Coroutine;
+    uint32_t status;
+    ARTCoroState state;
+} ARTCoro;
+
+struct art_scheduler_id_t {
+    size_t index;
+};
+
+typedef struct art_coro_deque_t {
+    pthread_mutex_t mtx;
+    // pthread_cond_t cond;
+
+    ARTCoro *first;
+    ARTCoro *last;
+} ARTCoroDeque;
+
+#define ART_DEFAULT_CORO_DEQUE      \
+    (ARTCoroDeque) {                \
+        PTHREAD_MUTEX_INITIALIZER,  \
+        NULL,                       \
+        NULL                        \
+    }
+
+typedef struct art_scheduler_t {
+    pthread_t thread_id;
+    ARTCoroDeque io_q;
+    ARTCoroDeque wait_q;
+    ARTCoroDeque active_q;
+
+    int epoll_fd;
+    DARRAY_PARTS(epoll_evs_, struct epoll_event);
+} ARTScheduler;
+
+typedef struct art_context_settings_t {
+    size_t sched_count;
+    size_t use_current_thread : 1;
+} ARTContextSettings;
+
+typedef struct art_cleanup_entry_t {
+    void (*fn)(OpaqueMemory);
+    OpaqueMemory data;
+} ARTCleanupEntry;
+
+struct art_context_t {
+    ARRAY_PARTS(scheds_, ARTScheduler);
+    ARTCoroDeque global_q;
+    DARRAY_PARTS(cleanups_, ARTCleanupEntry);
+};
 
 enum {
-    CORO_DISCARD,
-    CORO_FREE
+    ART_CO_DISCARD,
+    ART_CO_FREE
 };
 
-typedef struct coroutine_queue_node_t {
-    Coroutine *coro;
-    struct coroutine_queue_node_t *next;
-    size_t flags;
-} CoroutineQueue_Node;
-
-struct coroutine_queue_t {
-    CoroutineQueue_Node *head;
-    CoroutineQueue_Node *tail;
-};
-
-#define DEFINE_CORO(name)                                                   \
-    CoroutineResult                                                         \
+#define ART_DEFINE_CO(name)                                                 \
+    ARTCoroResult                                                           \
     name(                                                                   \
-        __attribute__((unused)) CoroutineContext *_coro_ctx_,               \
-        __attribute__((unused)) CoroutineQueue *_coro_queue_,               \
+        __attribute__((unused)) ARTContext *_coro_ctx_,                     \
+        __attribute__((unused)) ARTCoroState *_coro_state_,                 \
         __attribute__((unused)) OpaqueMemory _coro_arg_,                    \
         __attribute__((unused)) uint64_t stage                              \
     )
 
-#define _CORO_CASE_(c) case (c):
+#define _ART_CO_CASE_(c) case (c):
 
 // TODO: Better allocation bs
-#define CORO_INIT_BEGIN(r_type, state_type, arg_type)                       \
-    __attribute__((unused)) r_type *coro_result = _coro_ctx_->ret;          \
-    __attribute__((unused)) state_type *coro_state =                        \
-        (state_type *)_coro_ctx_->state;                                    \
+#define ART_CO_INIT_BEGIN(r_type, data_type, arg_type)                      \
+    __attribute__((unused)) r_type *coro_result = _coro_state_->ret;        \
+    __attribute__((unused)) data_type *coro_data =                          \
+        (data_type *)_coro_state_->data;                                    \
     switch (stage) {                                                        \
-    _CORO_CASE_(0) {                                                        \
-        _coro_ctx_->r_size = sizeof(r_type);                                \
-        _coro_ctx_->state_size = sizeof(state_type);                        \
-        coro_context_init(_coro_ctx_);                                      \
-        coro_result = (r_type *)_coro_ctx_->ret;                            \
-        coro_state = (state_type *)_coro_ctx_->state;                       \
+    _ART_CO_CASE_(0) {                                                      \
+        _coro_state_->r_size = sizeof(r_type);                              \
+        _coro_state_->data_size = sizeof(data_type);                        \
+        art_coro_state_init(_coro_state_);                                  \
+        coro_result = (r_type *)_coro_state_->ret;                          \
+        coro_data = (data_type *)_coro_state_->data;                        \
         __attribute__((unused)) arg_type *coro_argument =                   \
             (arg_type *)_coro_arg_
 
-#define CORO_INIT_END()                                                     \
-    return (CoroutineResult) {                                              \
-        .state = CORO_INITIALIZED,                                          \
+#define ART_CO_INIT_END()                                                   \
+    return (ARTCoroResult) {                                                \
+        .status = ART_CO_INITIALIZED,                                       \
         .stage = ++stage                                                    \
     };
 
-#define CORO_CUT_STAGE(stage_) } break; _CORO_CASE_(stage_) {
+#define ART_CO_CUT_STAGE(stage_) } break; _ART_CO_CASE_(stage_) {
 
-#define CORO_STAGE(stage_)                                                  \
-    } __attribute__((fallthrough)); _CORO_CASE_(stage_) {
+#define ART_CO_STAGE(stage_)                                                  \
+    } __attribute__((fallthrough)); _ART_CO_CASE_(stage_) {
 
-#define CORO_YIELD(stage_)                                                  \
-    return (CoroutineResult) {                                              \
-        .state = CORO_WAITING,                                              \
+#define ART_CO_YIELD(stage_)                                                \
+    return (ARTCoroResult) {                                                \
+        .status = ART_CO_WAITING,                                           \
         .stage = stage_                                                     \
     };
 
-#define CORO_RETURN(stage_)                                                 \
-    return (CoroutineResult) {                                              \
-        .state = CORO_DONE,                                                 \
+#define ART_CO_RETURN(stage_)                                               \
+    return (ARTCoroResult) {                                                \
+        .status = ART_CO_DONE,                                              \
         .stage = stage_                                                     \
     };
 
-#define CORO_DONE(stage_)                                                   \
-    return (CoroutineResult) {                                              \
-        .state = CORO_DONE,                                                 \
+#define ART_CO_DONE(stage_)                                                 \
+    return (ARTCoroResult) {                                                \
+        .status = ART_CO_DONE,                                              \
         .stage = stage_                                                     \
     };
 
-#define CORO_END()                                                          \
-    } break; } CORO_RETURN(0)
+#define ART_CO_END()                                                        \
+    } break; } ART_CO_RETURN(0)
 
-#define CORO_EMPTY() CORO_DONE(0)
+#define ART_CO_EMPTY() ART_CO_DONE(0)
 
-#define CORO_RUN(coro_, fn, arg_)                                           \
+#define ART_CO_RUN(coro_, fn, arg_)                                         \
     coro_init(coro_, fn, arg_);                                             \
     coro_queue_push_coro(_coro_queue_, coro_)
 
-#define CORO_AWAIT(stage_, coro_)                                           \
-    CORO_STAGE(stage_);                                                     \
-    if ((coro_)->state != CORO_DONE) { CORO_YIELD((stage_)); }
+#define ART_CO_AWAIT(stage_, coro_)                                         \
+    ART_CO_STAGE(stage_);                                                   \
+    if ((coro_)->state != ART_CO_DONE) { ART_CO_YIELD((stage_)); }
 
-void coro_context_init(CoroutineContext *ctx);
-// void coro_context_cleanup(CoroutineContext *ctx);
+void art_coro_state_init(ARTCoroState *ctx);
+// void coro_context_cleanup(ARTCoroContext *ctx);
 
-void coro_init(Coroutine *coro, CoroutineFunctionPtr fn, void *arg);
-CoroutineState coro_run(Coroutine *coro, CoroutineQueue *queue);
-void coro_cleanup(Coroutine *coro);
+void art_coro_init(ARTCoro *coro, ARTCoroFunctionPtr fn, void *arg, size_t flags);
+ARTCoroStatus coro_run(ARTContext *ctx, ARTCoro *coro);
+void art_coro_cleanup(ARTCoro *coro);
 
+void art_scheduler_init(ARTScheduler *sched);
+void art_scheduler_start(ARTScheduler *sched);
+void art_scheduler_cancel(ARTScheduler *sched);
+void art_scheduler_cleanup(ARTScheduler *sched);
 
-CoroutineQueue_Node *coro_queue_node_new(
-    Coroutine *coro,
-    size_t flags
+// TODO: Use some enum for statuses or sum shite
+
+int art_context_init(ARTContext *ctx, ARTContextSettings const *settings);
+ARTCoro *art_context_new_coro(ARTContext *ctx);
+void art_context_run_coro(ARTContext *ctx, ARTCoro *coro);
+void art_context_register_cleanup(
+    ARTContext *ctx,
+    void (*fn)(OpaqueMemory),
+    OpaqueMemory data
 );
-void coro_queue_node_delete(CoroutineQueue_Node *coro);
+void art_context_join(ARTContext *ctx);
+void art_context_cleanup(ARTContext *ctx);
 
-void coro_queue_init(CoroutineQueue *queue);
-void coro_queue_push_coro(
-    CoroutineQueue *queue,
-    Coroutine *coro,
-    size_t flags
-);
-void coro_queue_push(CoroutineQueue *queue, CoroutineQueue_Node *node);
-CoroutineQueue_Node *coro_queue_pop(CoroutineQueue *queue);
-
-static inline int coro_queue_is_empty(CoroutineQueue *queue) {
-    return queue->head == NULL;
-}
-
-void coro_queue_cleanup(CoroutineQueue *queue);
-
-#endif /* CORO_H */
+#endif /* ART_CO_H */

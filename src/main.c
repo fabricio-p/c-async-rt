@@ -18,6 +18,8 @@
 #include "async.h"
 #include "err_utils.h"
 
+// TODO: Function for directly spawning detached tasks in context
+
 #define LOG_INFO_(fmtstr)                                                   \
     fprintf(stderr, "[INFO:" __FILE__ ":%d] " fmtstr, __LINE__)
 
@@ -33,13 +35,11 @@ struct io_uring_user_data {
 
 void
 spawn_discardable(
-    CoroutineQueue *queue,
-    CoroutineFunctionPtr f,
+    ARTCoro *coro,
+    ARTCoroFunctionPtr f,
     OpaqueMemory a
 ) {
-    Coroutine *coro = malloc(sizeof(Coroutine));
-    coro_init(coro, f, a);
-    coro_queue_push_coro(queue, coro, (1 << CORO_DISCARD) | (1 << CORO_FREE));
+    art_coro_init(coro, f, a, (1 << ART_CO_DISCARD) | (1 << ART_CO_FREE));
 }
 
 typedef struct {
@@ -53,7 +53,7 @@ typedef struct {
 typedef struct {
     struct sockaddr addr;
     socklen_t addrlen;
-    CoroutineFunctionPtr handler;
+    ARTCoroFunctionPtr handler;
 
     int socket_fd;
     struct io_uring_user_data accept_res;
@@ -97,7 +97,7 @@ server_settings_default_init(ServerSettings *settings) {
 ServerStatus
 server_init(
     Server *server,
-    CoroutineFunctionPtr handler,
+    ARTCoroFunctionPtr handler,
     ServerSettings const *settings
 ) {
     ServerStatus status = SERVER_OK;
@@ -202,16 +202,16 @@ submit_accept(
     return 0;
 }
 
-DEFINE_CORO(server_run) {
+ART_DEFINE_CO(server_run) {
     Server *server =
-        _coro_ctx_->state == NULL ? NULL : *(Server **)_coro_ctx_->state;
-    CORO_INIT_BEGIN(void, Server *, Server *); {
+        _coro_state_->data == NULL ? NULL : *(Server **)_coro_state_->data;
+    ART_CO_INIT_BEGIN(void, Server *, Server *); {
         LOG_INFO("coro_argument = %p\n", (void *)coro_argument);
         LOG_INFO("*coro_argument = %p\n", (void *)*coro_argument);
-        *coro_state = *coro_argument;
-    } CORO_INIT_END();
+        *coro_data = *coro_argument;
+    } ART_CO_INIT_END();
 
-    CORO_STAGE(1) {
+    ART_CO_STAGE(1) {
         LOG_INFO_("Submitting accept op\n");
         submit_accept(
             &server->uring,
@@ -222,10 +222,10 @@ DEFINE_CORO(server_run) {
             1
         );
         LOG_INFO_("Submitted accept op\n");
-        CORO_YIELD(2);
+        ART_CO_YIELD(2);
     }
 
-    CORO_STAGE(2) {
+    ART_CO_STAGE(2) {
         struct io_uring_cqe *cqe;
         while (io_uring_peek_cqe(&server->uring, &cqe) == 0) {
             struct io_uring_user_data *user_data = io_uring_cqe_get_data(cqe);
@@ -238,30 +238,31 @@ DEFINE_CORO(server_run) {
             atomic_store(&user_data->is_done, 1);
             io_uring_cqe_seen(&server->uring, cqe);
         }
-        CORO_YIELD(3);
+        ART_CO_YIELD(3);
     }
 
-    CORO_STAGE(3) {
+    ART_CO_STAGE(3) {
         if (atomic_load(&server->accept_res.is_done) != 0) {
             if (server->accept_res.res < 0) {
                 LOG_INFO(
                     "accept failed [%s]\n",
                     strerror(-server->accept_res.res)
                 );
-                CORO_YIELD(4);
+                ART_CO_YIELD(4);
             }
             LOG_INFO("connection accepted (%d)\n", server->accept_res.res);
             HandlerArgument arg = {
                 .fd = server->accept_res.res,
                 .server = server,
             };
-            spawn_discardable(_coro_queue_, server->handler, &arg);
+            ARTCoro coro;
+            spawn_discardable(&coro, server->handler, &arg);
         } else {
-            CORO_YIELD(2);
+            ART_CO_YIELD(2);
         }
     }
 
-    CORO_STAGE(4) {
+    ART_CO_STAGE(4) {
         submit_accept(
             &server->uring,
             server->socket_fd,
@@ -270,10 +271,10 @@ DEFINE_CORO(server_run) {
             &server->accept_res,
             1
         );
-        CORO_YIELD(2);
+        ART_CO_YIELD(2);
     }
 
-    CORO_END();
+    ART_CO_END();
 }
 
 typedef struct {
@@ -287,105 +288,121 @@ typedef struct {
 
 #include <time.h>
 
-DEFINE_CORO(handler) {
-    CORO_INIT_BEGIN(void, HandlerState, HandlerArgument); {
-        coro_state->fd = coro_argument->fd;
-        coro_state->uring = &coro_argument->server->uring;
-        memset(coro_state->buffer, 0, sizeof(coro_state->buffer));
-    } CORO_INIT_END();
+ART_DEFINE_CO(handler) {
+    enum {
+        REQ_RECV_PING = 1, RECV_PING,
+        REQ_SEND_PONG, SENT_PONG,
+        TIMER_WAIT,
+        REQ_CLOSE, CLOSED
+    };
+    ART_CO_INIT_BEGIN(void, HandlerState, HandlerArgument); {
+        coro_data->fd = coro_argument->fd;
+        coro_data->uring = &coro_argument->server->uring;
+        memset(coro_data->buffer, 0, sizeof(coro_data->buffer));
+    } ART_CO_INIT_END();
 
-    CORO_STAGE(1) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(coro_state->uring);
-        if (sqe == NULL) { CORO_YIELD(1); }
-        atomic_store(&coro_state->res.is_done, 0);
+    ART_CO_STAGE(REQ_RECV_PING) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(coro_data->uring);
+        if (sqe == NULL) { ART_CO_YIELD(REQ_RECV_PING); }
+        atomic_store(&coro_data->res.is_done, 0);
         LOG_INFO_("Gonna receive brb\n");
-        io_uring_prep_recv(sqe, coro_state->fd, coro_state->buffer, 256, 0);
-        io_uring_sqe_set_data(sqe, &coro_state->res);
-        io_uring_submit(coro_state->uring);
-        CORO_YIELD(2);
+        io_uring_prep_recv(sqe, coro_data->fd, coro_data->buffer, 256, 0);
+        io_uring_sqe_set_data(sqe, &coro_data->res);
+        io_uring_submit(coro_data->uring);
+        ART_CO_YIELD(RECV_PING);
     }
 
-    CORO_STAGE(2) {
-        if (atomic_load(&coro_state->res.is_done) == 0) {
-            CORO_YIELD(2);
+    ART_CO_STAGE(RECV_PING) {
+        if (atomic_load(&coro_data->res.is_done) == 0) {
+            ART_CO_YIELD(RECV_PING);
         }
-        if (coro_state->res.res < 0) {
-            LOG_INFO("recv failed: %s\n", strerror(-coro_state->res.res));
-            CORO_YIELD(6);
+        if (coro_data->res.res < 0) {
+            LOG_INFO("recv failed: %s\n", strerror(-coro_data->res.res));
+            ART_CO_YIELD(REQ_CLOSE);
         }
-        LOG_INFO("buffer: %s\n", coro_state->buffer);
-        if (memcmp(coro_state->buffer, "ping", 4) == 0) {
+        LOG_INFO("buffer: %s\n", coro_data->buffer);
+        if (memcmp(coro_data->buffer, "ping", 4) == 0) {
             LOG_INFO_("Got pinged\n");
-            CORO_YIELD(3);
+            ART_CO_YIELD(REQ_SEND_PONG);
         }
         LOG_INFO_("No pongs :(\n");
-        CORO_YIELD(6);
+        ART_CO_YIELD(REQ_CLOSE);
     }
 
-    CORO_STAGE(3) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(coro_state->uring);
-        if (sqe == NULL) { CORO_YIELD(3); }
-        atomic_store(&coro_state->res.is_done, 0);
+    ART_CO_STAGE(REQ_SEND_PONG) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(coro_data->uring);
+        if (sqe == NULL) { ART_CO_YIELD(REQ_SEND_PONG); }
+        atomic_store(&coro_data->res.is_done, 0);
         LOG_INFO_("Gonna send pong\n");
-        io_uring_prep_send(sqe, coro_state->fd, "pong", 4, 0);
-        io_uring_sqe_set_data(sqe, &coro_state->res);
-        io_uring_submit(coro_state->uring);
-        CORO_YIELD(4);
+        io_uring_prep_send(sqe, coro_data->fd, "pong", 4, 0);
+        io_uring_sqe_set_data(sqe, &coro_data->res);
+        io_uring_submit(coro_data->uring);
+        ART_CO_YIELD(SENT_PONG);
     }
 
-    CORO_STAGE(4) {
-        if (atomic_load(&coro_state->res.is_done) == 0) {
-            CORO_YIELD(4);
+    ART_CO_STAGE(SENT_PONG) {
+        if (atomic_load(&coro_data->res.is_done) == 0) {
+            ART_CO_YIELD(SENT_PONG);
         }
-        if (coro_state->res.res < 0) {
-            LOG_INFO("send failed: %s\n", strerror(-coro_state->res.res));
-            CORO_YIELD(6);
+        if (coro_data->res.res < 0) {
+            LOG_INFO("send failed: %s\n", strerror(-coro_data->res.res));
+            ART_CO_YIELD(REQ_CLOSE);
         }
-        LOG_INFO("Ponged (%d)\n", coro_state->res.res);
-        clock_gettime(CLOCK_MONOTONIC, &coro_state->timer);
-        CORO_YIELD(5);
+        LOG_INFO("Ponged (%d)\n", coro_data->res.res);
+        clock_gettime(CLOCK_MONOTONIC, &coro_data->timer);
+        ART_CO_YIELD(TIMER_WAIT);
     }
 
-    CORO_STAGE(5) {
+    ART_CO_STAGE(TIMER_WAIT) {
 #define TIME_SECOND 1000000000
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t const start =
-            coro_state->timer.tv_sec * TIME_SECOND + coro_state->timer.tv_nsec;
+            coro_data->timer.tv_sec * TIME_SECOND + coro_data->timer.tv_nsec;
         uint64_t const end = now.tv_sec * TIME_SECOND + now.tv_nsec;
         uint64_t const diff = end - start;
 
         if (diff < 10ull * TIME_SECOND) {
-            CORO_YIELD(5);
+            ART_CO_YIELD(TIMER_WAIT);
         }
     }
 
-    CORO_STAGE(6) {
+    ART_CO_STAGE(REQ_CLOSE) {
         LOG_INFO_("Closing connection\n");
-        struct io_uring_sqe *sqe = io_uring_get_sqe(coro_state->uring);
-        if (sqe == NULL) { CORO_YIELD(6); }
-        atomic_store(&coro_state->res.is_done, 0);
-        io_uring_prep_close(sqe, coro_state->fd);
-        io_uring_sqe_set_data(sqe, &coro_state->res);
-        io_uring_submit(coro_state->uring);
-        CORO_YIELD(7);
+        struct io_uring_sqe *sqe = io_uring_get_sqe(coro_data->uring);
+        if (sqe == NULL) { ART_CO_YIELD(REQ_CLOSE); }
+        atomic_store(&coro_data->res.is_done, 0);
+        io_uring_prep_close(sqe, coro_data->fd);
+        io_uring_sqe_set_data(sqe, &coro_data->res);
+        io_uring_submit(coro_data->uring);
+        ART_CO_YIELD(CLOSED);
     }
 
-    CORO_STAGE(7) {
-        if (atomic_load(&coro_state->res.is_done) == 0) {
-            CORO_YIELD(7);
+    ART_CO_STAGE(CLOSED) {
+        if (atomic_load(&coro_data->res.is_done) == 0) {
+            ART_CO_YIELD(CLOSED);
         }
-        LOG_INFO("Connection closed (%d)\n", coro_state->res.res);
+        LOG_INFO("Connection closed (%d)\n", coro_data->res.res);
     }
 
-    CORO_END();
+    ART_CO_END();
+}
+
+void server_destroy(OpaqueMemory x) {
+    Server *server = x;
+    server_cleanup(server); free(server);
 }
 
 int main() {
     int status = 0;
-    CoroutineQueue queue;
-    coro_queue_init(&queue);
     LOG_INFO_("Queue initialized\n");
+    ARTContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ARTContextSettings ctx_settings;
+    memset(&ctx_settings, 0, sizeof(ctx_settings));
+    ctx_settings.sched_count = 4;
+    ctx_settings.use_current_thread = true;
+    art_context_init(&ctx, &ctx_settings);
 
     Server *server = malloc(sizeof(Server));
     ServerSettings settings;
@@ -397,22 +414,14 @@ int main() {
     THROW_IF(server_status != SERVER_OK, 1, 0);
     LOG_INFO_("Server initialized\n");
 
-    Coroutine server_coro;
-    coro_init(&server_coro, server_run, &server);
-    LOG_INFO_("Coroutine initialized\n");
+    ARTCoro *server_coro = art_context_new_coro(&ctx);
+    art_coro_init(server_coro, server_run, &server, 1 << ART_CO_DISCARD);
+    LOG_INFO_("ARTCoro initialized\n");
+    art_context_run_coro(&ctx, server_coro);
+    art_context_register_cleanup(&ctx, server_destroy, server);
+    art_context_join(&ctx);
 
-    coro_queue_push_coro(&queue, &server_coro, 1 << CORO_DISCARD);
-    LOG_INFO_("Coroutine pushed\n");
-    while (!coro_queue_is_empty(&queue)) {
-        CoroutineQueue_Node *node = coro_queue_pop(&queue);
-        if (coro_run(node->coro, &queue) == CORO_DONE) {
-            coro_queue_node_delete(node);
-        } else {
-            coro_queue_push(&queue, node);
-        }
-    }
-    server_cleanup(server); free(server);
-    coro_queue_cleanup(&queue);
+    // art_context_cleanup(&ctx);
 catch_0:
     return status;
 }
