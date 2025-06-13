@@ -18,7 +18,7 @@ art_ds_darray_grow(
 }
 
 int
-art_ds_array_init(
+art_ds_darray_init(
     void **data_p,
     size_t *size_p,
     size_t *cap_p,

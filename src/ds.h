@@ -1,8 +1,10 @@
-#ifndef ASYNCRT_DS_H
-#define ASYNCRT_DS_H
+#ifndef ART_DS_H
+#define ART_DS_H
 #include <stdlib.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+
+typedef void *OpaqueMemory;
 
 #define LIST_PARTS(PREFIX, TYPE) TYPE *PREFIX##next
 #define DOUBLE_LIST_PARTS(PREFIX, TYPE) \
@@ -38,7 +40,7 @@
 
 #define DARRAY_INIT(X, PREFIX, TYPE, CAP)   \
     art_ds_darray_init(                     \
-        &(X)->PREFIX##items,                \
+        (void **)&(X)->PREFIX##items,       \
         &(X)->PREFIX##size,                 \
         &(X)->PREFIX##capacity,             \
         sizeof(TYPE),                       \
@@ -95,4 +97,4 @@ art_ds_atomic_ref(atomic_uint_fast32_t *refcount);
 uint32_t
 art_ds_atomic_unref(atomic_uint_fast32_t *refcount);
 
-#endif /* ASYNCRT_DS_H */
+#endif /* ART_DS_H */

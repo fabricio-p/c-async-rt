@@ -1,5 +1,5 @@
-#ifndef ERR_UTILS_H
-#define ERR_UTILS_H
+#ifndef ART_ERR_UTILS_H
+#define ART_ERR_UTILS_H
 
 #define THROW(status_, label)                                               \
     do {                                                                    \
@@ -13,4 +13,4 @@
 
 #define RETURN(label) goto catch_##label
 
-#endif /* ERR_UTILS_H */
+#endif /* ART_ERR_UTILS_H */

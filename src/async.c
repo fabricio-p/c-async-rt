@@ -1,89 +1,34 @@
 #include <stdatomic.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "async.h"
+#include "logging.h"
 
-static atomic_uintmax_t counter = 0;
-
-void
+static void *
 art_scheduler_loop(ARTScheduler *sched);
-
-void
-coro_state_init(ARTCoroState *ctx) {
-    ctx->ret = ctx->r_size != 0 ? malloc(ctx->r_size) : NULL;
-    ctx->data = ctx->data_size != 0 ? malloc(ctx->data_size) : NULL;
-}
-
-// void
-// coro_context_cleanup(ARTCoroContext *ctx) {
-//     // free(ctx->ret);
-//     free(ctx->state);
-// }
-
-#define LOG_INFO_(fmtstr)                                               \
-    fprintf(stderr, "[INFO:" __FILE__ ":%d] " fmtstr, __LINE__)
-
-#define LOG_INFO(fmtstr, ...)                                               \
-    fprintf(stderr, "[INFO:" __FILE__ ":%d] " fmtstr, __LINE__, __VA_ARGS__)
-
-void
-art_coro_init(ARTCoro *coro, ARTCoroFunctionPtr fn, void *arg, size_t flags) {
-    coro->id = atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
-    coro->fn = fn;
-    coro->flags = flags;
-    coro->stage = 0;
-    coro->state.data = NULL;
-    coro->state.ret = NULL;
-    coro->state.r_size = 0;
-    coro->state.data_size = 0;
-    ARTCoroResult res = fn(NULL, &coro->state, arg, 0);
-    coro->status = res.status;
-    coro->stage = res.stage;
-    LOG_INFO("ARTCoro (%" PRIuMAX ") initialized\n", coro->id);
-}
-
-void
-art_coro_cleanup(ARTCoro *coro) {
-    if (coro->state.data != NULL) {
-        free(coro->state.data);
-        coro->state.data = NULL;
-    }
-    if (coro->state.ret != NULL) {
-        free(coro->state.ret);
-        coro->state.ret = NULL;
-    }
-    LOG_INFO("ARTCoro (%" PRIuMAX ") cleaned up\n", coro->id);
-}
-
-ARTCoroStatus
-art_coro_run(ARTContext *ctx, ARTCoro *coro) {
-    if (coro->status == ART_CO_DONE) {
-        if (coro->state.data != NULL) {
-            free(coro->state.data);
-            coro->state.data = NULL;
-        }
-        return ART_CO_DONE;
-    }
-    ARTCoroResult res = coro->fn(ctx, &coro->state, NULL, coro->stage);
-    coro->status = res.status;
-    coro->stage = res.stage;
-    return res.status;
-}
 
 int
 art_context_init(ARTContext *ctx, ARTContextSettings const *settings) {
+    ctx->main_thread_id = pthread_self();
     ctx->scheds_size = settings->sched_count;
     ctx->scheds_items = calloc(ctx->scheds_size, sizeof(ARTCoroDeque));
     for (size_t i = 0; i < ctx->scheds_size; i++) {
-        art_scheduler_init(&ctx->scheds_items[i]);
+        art_scheduler_init(ctx, &ctx->scheds_items[i]);
         if (i != 0 || !settings->use_current_thread) {
             art_scheduler_start(&ctx->scheds_items[i]);
         }
     }
     if (settings->use_current_thread) {
-        ctx->scheds_items[0].thread_id = pthread_self();
+        ctx->scheds_items[0].thread_id = ctx->main_thread_id;
     }
-    ctx->global_q = ART_DEFAULT_CORO_DEQUE;
+    art_coro_gqueue_init(&ctx->global_q);
+    LOG_INFO_("Global queue initialized\n");
+
+    LOG_INFO(
+        "Context initialized (%" PRIuMAX " schedulers)\n",
+        ctx->scheds_size
+    );
 
     return 0;
 }
@@ -95,48 +40,8 @@ art_context_new_coro(__attribute__((unused)) ARTContext *ctx) {
 }
 
 void
-art_coro_deque_push_back(ARTCoroDeque *deque, ARTCoro *coro) {
-    pthread_mutex_lock(&deque->mtx);
-
-    coro->prev = deque->last;
-    coro->next = NULL;
-    if (deque->last != NULL) {
-        deque->last->next = coro;
-    } else {
-        deque->first = coro;
-    }
-    deque->last = coro;
-
-    pthread_mutex_unlock(&deque->mtx);
-}
-
-ARTCoro *
-art_coro_deque_pop_front(ARTCoroDeque *deque) {
-    ARTCoro *coro = NULL;
-
-    pthread_mutex_lock(&deque->mtx);
-
-    if (deque->first == NULL) {
-        goto end;
-    }
-    coro = deque->first;
-    if (deque->last == coro) {
-        deque->last = NULL;
-    }
-    else {
-        coro->next->prev = coro->prev;
-    }
-    deque->first = coro->next;
-    coro->next = NULL;
-
-end:
-    pthread_mutex_unlock(&deque->mtx);
-    return coro;
-}
-
-void
-art_context_run_coro(ARTContext *ctx, ARTCoro *coro) {
-    art_coro_deque_push_back(&ctx->global_q, coro);
+art_context_run_coros(ARTContext *ctx, ARTCoro **coros, size_t n) {
+    art_coro_gqueue_push(&ctx->global_q, coros, n);
 }
 
 void
@@ -152,7 +57,7 @@ art_context_register_cleanup(
 
 void
 art_context_join(ARTContext *ctx) {
-    if (pthread_equal(pthread_self(), ctx->scheds_items[0].thread_id)) {
+    if (pthread_equal(ctx->main_thread_id, ctx->scheds_items[0].thread_id)) {
         art_scheduler_loop(&ctx->scheds_items[0]);
     } else {
         pthread_join(ctx->scheds_items[0].thread_id, NULL);
@@ -171,4 +76,121 @@ art_context_cleanup(ARTContext *ctx) {
         ctx->cleanups_items[i].fn(ctx->cleanups_items[i].data);
     }
     DARRAY_UNINIT(ctx, cleanups_);
+
+    art_coro_gqueue_cleanup(&ctx->global_q);
+}
+
+void
+art_scheduler_init(ARTContext *ctx, ARTScheduler *sched) {
+    sched->ctx = ctx;
+    art_coro_deque_init(&sched->wait_q);
+    art_coro_deque_init(&sched->io_q);
+    art_coro_deque_init(&sched->active_q);
+    sched->epoll_fd = 0;
+    DARRAY_INIT(sched, epoll_evs_, struct epoll_event, 10);
+    // TODO: Maybe use some id thing
+    LOG_INFO(
+        "Scheduler initialized (id=%" PRIuMAX ")\n",
+        sched - ctx->scheds_items
+    );
+}
+
+void *
+art_scheduler_loop(ARTScheduler *sched) {
+    LOG_INFO(
+        "Scheduler loop started (id=%" PRIuMAX ")\n",
+        sched - sched->ctx->scheds_items
+    );
+#define PIPE_BATCH_SIZE 10
+    pthread_cleanup_push((void (*) (void *))art_scheduler_cleanup, sched);
+    for (;;) {
+        pthread_testcancel();
+        ARTCoro *coro = art_coro_deque_pop_front_lock(&sched->active_q);
+        if (coro == NULL) {
+            art_coro_gqueue_lock(&sched->ctx->global_q);
+            size_t count = 0;
+            for (;;) {
+                count = art_coro_gqueue_fetch_batch(
+                    &sched->ctx->global_q,
+                    &sched->active_q,
+                    1 // PIPE_BATCH_SIZE
+                );
+                if (count == 0) {
+                    art_coro_gqueue_wait(&sched->ctx->global_q);
+                    continue;
+                }
+                break;
+            }
+            art_coro_gqueue_unlock(&sched->ctx->global_q);
+            continue;
+        }
+        ARTCoroStatus status = art_coro_run(sched->ctx, coro);
+        if (status == ART_CO_DONE && coro->flags & (1 << ART_CO_FREE)) {
+            art_coro_cleanup(coro);
+            // TODO: Don't do this directly like this
+            free(coro);
+        } else if (status != ART_CO_DONE) {
+            art_coro_deque_push_back_lock(&sched->active_q, coro);
+        }
+    }
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+
+void
+art_scheduler_start(ARTScheduler *sched) {
+    LOG_INFO(
+        "Starting scheduler (id=%" PRIuMAX ")\n",
+        sched - sched->ctx->scheds_items
+    );
+    pthread_create(
+        &sched->thread_id,
+        NULL,
+        (void *(*) (void *))art_scheduler_loop,
+        sched
+    );
+}
+
+void
+art_scheduler_cancel(ARTScheduler *sched) {
+    LOG_INFO(
+        "Canceling scheduler (id=%" PRIuMAX ")\n",
+        sched - sched->ctx->scheds_items
+    );
+    pthread_cancel(sched->thread_id);
+}
+
+
+void
+art_scheduler_cleanup(ARTScheduler *sched) {
+    DARRAY_UNINIT(sched, epoll_evs_);
+    close(sched->epoll_fd);
+    sched->epoll_fd = 0;
+
+    for (
+        ARTCoro *coro = sched->io_q.first;
+        coro != NULL;
+        coro = DOUBLE_LIST_NEXT(coro,)
+    ) {
+        art_coro_cleanup(coro);
+    }
+    art_coro_deque_cleanup(&sched->io_q);
+
+    for (
+        ARTCoro *coro = sched->wait_q.first;
+        coro != NULL;
+        coro = DOUBLE_LIST_NEXT(coro,)
+    ) {
+        art_coro_cleanup(coro);
+    }
+    art_coro_deque_cleanup(&sched->wait_q);
+
+    for (
+        ARTCoro *coro = sched->active_q.first;
+        coro != NULL;
+        coro = DOUBLE_LIST_NEXT(coro,)
+    ) {
+        art_coro_cleanup(coro);
+    }
+    art_coro_deque_cleanup(&sched->active_q);
 }
