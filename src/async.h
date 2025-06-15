@@ -22,7 +22,8 @@ typedef struct art_scheduler_t {
     pthread_t thread_id;
     ARTCoroDeque io_q;
     ARTCoroDeque wait_q;
-    ARTCoroDeque active_q;
+    ARTCoroDeque active_qs[2];
+    atomic_uint active_q_idx;
 
     int epoll_fd;
     DARRAY_PARTS(epoll_evs_, struct epoll_event);

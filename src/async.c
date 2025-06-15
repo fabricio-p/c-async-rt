@@ -1,12 +1,21 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "async.h"
 #include "logging.h"
 
 static void *
 art_scheduler_loop(ARTScheduler *sched);
+
+static bool
+art_scheduler_next_task(
+    ARTCoro **coro,
+    ARTScheduler *sched,
+    ARTCoroDeque **active_q,
+    ARTCoroDeque **buffer_q
+);
 
 int
 art_context_init(ARTContext *ctx, ARTContextSettings const *settings) {
@@ -85,8 +94,9 @@ art_scheduler_init(ARTContext *ctx, ARTScheduler *sched) {
     sched->ctx = ctx;
     art_coro_deque_init(&sched->wait_q);
     art_coro_deque_init(&sched->io_q);
-    art_coro_deque_init(&sched->active_q);
-    sched->epoll_fd = 0;
+    art_coro_deque_init(&sched->active_qs[0]);
+    art_coro_deque_init(&sched->active_qs[1]);
+    sched->epoll_fd = epoll_create1(0);
     DARRAY_INIT(sched, epoll_evs_, struct epoll_event, 10);
     // TODO: Maybe use some id thing
     LOG_INFO(
@@ -105,32 +115,75 @@ art_scheduler_loop(ARTScheduler *sched) {
     pthread_cleanup_push((void (*) (void *))art_scheduler_cleanup, sched);
     for (;;) {
         pthread_testcancel();
-        ARTCoro *coro = art_coro_deque_pop_front_lock(&sched->active_q);
+        ARTCoroDeque *active_q;
+        ARTCoroDeque *buffer_q;
+        ARTCoro *coro;
+
+        bool queues_swapped = art_scheduler_next_task(
+            &coro,
+            sched,
+            &active_q,
+            &buffer_q
+        );
         if (coro == NULL) {
+            goto poll_events;
+        }
+
+        ARTCoroResult coro_res = art_coro_run(sched, coro);
+        if (coro_res.status == ART_CO_DONE && coro->flags & (1 << ART_CO_FREE)) {
+            art_coro_cleanup(coro);
+            // TODO: Don't do this directly like this
+            free(coro);
+        } else if (
+            coro_res.status == ART_CO_POLL_IO_READ
+            || coro_res.status == ART_CO_POLL_IO_WRITE
+        ) {
+            struct epoll_event ev;
+            ev.events =
+                coro_res.status == ART_CO_POLL_IO_READ ? EPOLLIN : EPOLLOUT;
+            if (coro_res.d.io.once) {
+                ev.events |= EPOLLONESHOT;
+            }
+            ev.data.ptr = coro;
+            epoll_ctl(sched->epoll_fd, EPOLL_CTL_ADD, coro_res.d.io.fd, &ev);
+            art_coro_deque_push_back(&sched->io_q, coro);
+        }
+        if (coro_res.status != ART_CO_DONE) {
+            art_coro_deque_push_back(buffer_q, coro);
+        }
+
+poll_events:
+        if (queues_swapped) {
+            int count = epoll_wait(
+                sched->epoll_fd,
+                sched->epoll_evs_items,
+                sched->epoll_evs_size,
+                1
+            );
+            for (int i = 0; i < count; i++) {
+                struct epoll_event *ev = &sched->epoll_evs_items[i];
+                ARTCoro *coro = ev->data.ptr;
+                art_coro_deque_pluck(&sched->io_q, coro);
+                art_coro_deque_push_back(buffer_q, coro);
+            }
+        }
+
+        {
             art_coro_gqueue_lock(&sched->ctx->global_q);
             size_t count = 0;
             for (;;) {
                 count = art_coro_gqueue_fetch_batch(
                     &sched->ctx->global_q,
-                    &sched->active_q,
+                    buffer_q,
                     1 // PIPE_BATCH_SIZE
                 );
-                if (count == 0) {
+                if (coro == NULL && count == 0) {
                     art_coro_gqueue_wait(&sched->ctx->global_q);
                     continue;
                 }
                 break;
             }
             art_coro_gqueue_unlock(&sched->ctx->global_q);
-            continue;
-        }
-        ARTCoroStatus status = art_coro_run(sched->ctx, coro);
-        if (status == ART_CO_DONE && coro->flags & (1 << ART_CO_FREE)) {
-            art_coro_cleanup(coro);
-            // TODO: Don't do this directly like this
-            free(coro);
-        } else if (status != ART_CO_DONE) {
-            art_coro_deque_push_back_lock(&sched->active_q, coro);
         }
     }
     pthread_cleanup_pop(1);
@@ -165,7 +218,7 @@ void
 art_scheduler_cleanup(ARTScheduler *sched) {
     DARRAY_UNINIT(sched, epoll_evs_);
     close(sched->epoll_fd);
-    sched->epoll_fd = 0;
+    sched->epoll_fd = -1;
 
     for (
         ARTCoro *coro = sched->io_q.first;
@@ -186,11 +239,51 @@ art_scheduler_cleanup(ARTScheduler *sched) {
     art_coro_deque_cleanup(&sched->wait_q);
 
     for (
-        ARTCoro *coro = sched->active_q.first;
+        ARTCoro *coro = sched->active_qs[0].first;
         coro != NULL;
         coro = DOUBLE_LIST_NEXT(coro,)
     ) {
         art_coro_cleanup(coro);
     }
-    art_coro_deque_cleanup(&sched->active_q);
+    art_coro_deque_cleanup(&sched->active_qs[0]);
+
+    for (
+        ARTCoro *coro = sched->active_qs[1].first;
+        coro != NULL;
+        coro = DOUBLE_LIST_NEXT(coro,)
+    ) {
+        art_coro_cleanup(coro);
+    }
+    art_coro_deque_cleanup(&sched->active_qs[1]);
+}
+
+static bool
+art_scheduler_next_task(
+    ARTCoro **coro,
+    ARTScheduler *sched,
+    ARTCoroDeque **active_q,
+    ARTCoroDeque **buffer_q
+) {
+    size_t active_idx = atomic_load_explicit(
+        &sched->active_q_idx,
+        memory_order_acquire
+    );
+    size_t buffer_idx = !active_idx;
+    *active_q = &sched->active_qs[active_idx];
+    *buffer_q = &sched->active_qs[buffer_idx];
+    *coro = art_coro_deque_pop_front_lock(*active_q);
+    if (coro == NULL) {
+        active_idx = !active_idx;
+        buffer_idx = !buffer_idx;
+        atomic_store_explicit(
+            &sched->active_q_idx,
+            active_idx,
+            memory_order_release
+        );
+        *active_q = &sched->active_qs[active_idx];
+        *buffer_q = &sched->active_qs[buffer_idx];
+        *coro = art_coro_deque_pop_front_lock(*active_q);
+        return true;
+    }
+    return false;
 }

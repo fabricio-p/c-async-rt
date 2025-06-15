@@ -146,6 +146,22 @@ art_coro_deque_pop_front_lock(ARTCoroDeque *deque) {
     return coro;
 }
 
+void
+art_coro_deque_pluck(ARTCoroDeque *deque, ARTCoro *coro) {
+    if (coro->prev == NULL) {
+        deque->first = coro->next;
+    } else {
+        coro->prev->next = coro->next;
+    }
+    if (coro->next == NULL) {
+        deque->last = coro->prev;
+    } else {
+        coro->next->prev = coro->prev;
+    }
+
+    coro->prev = NULL;
+    coro->next = NULL;
+}
 
 void
 art_coro_deque_cleanup(ARTCoroDeque *deque) {

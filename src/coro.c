@@ -40,18 +40,11 @@ art_coro_cleanup(ARTCoro *coro) {
     LOG_INFO("ARTCoro (%" PRIuMAX ") cleaned up\n", coro->id);
 }
 
-ARTCoroStatus
-art_coro_run(ARTContext *ctx, ARTCoro *coro) {
-    if (coro->status == ART_CO_DONE) {
-        // if (coro->state.data != NULL) {
-        //     free(coro->state.data);
-        //     coro->state.data = NULL;
-        // }
-        return ART_CO_DONE;
-    }
-    ARTCoroResult res = coro->fn(ctx, &coro->state, NULL, coro->stage);
+ARTCoroResult
+art_coro_run(ARTScheduler *scheduler, ARTCoro *coro) {
+    ARTCoroResult res = coro->fn(scheduler, &coro->state, NULL, coro->stage);
     coro->status = res.status;
     coro->stage = res.stage;
-    return res.status;
+    return res;
 }
 

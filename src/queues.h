@@ -45,6 +45,8 @@ art_coro_deque_pop_front(ARTCoroDeque *deque);
 ARTCoro *
 art_coro_deque_pop_front_lock(ARTCoroDeque *deque);
 void
+art_coro_deque_pluck(ARTCoroDeque *deque, ARTCoro *coro);
+void
 art_coro_deque_cleanup(ARTCoroDeque *deque);
 
 #endif /* ART_QUEUES_H */
