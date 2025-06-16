@@ -128,6 +128,26 @@ enum {
     };                                                                      \
     ART_CO_STAGE(stage_)
 
+#define ART_CO_POLL_IO_LOOP_BEGIN(stage_, action_, ...)                     \
+    ART_CO_STAGE(stage_);                                                   \
+    ARTCoroResult res_##stage_ = (ARTCoroResult) {                          \
+        .status = ART_CO_POLL_IO_##action_,                                 \
+        .stage = stage_,                                                    \
+        .d.io = { __VA_ARGS__ }                                             \
+    };
+
+#define ART_CO_POLL_IO_LOOP_END(stage_)                                     \
+    return res_##stage_
+
+// #define ART_CO_POLL_IO_LOOP_BREAK(stage_, action_, ...)                      \
+//     ART_CO_STAGE(stage_);                                                   \
+//     ARTCoroResult res_##stage_ = (ARTCoroResult) {                          \
+//         .status = ART_CO_POLL_IO_##action_,                                 \
+//         .stage = stage_,                                                    \
+//         .d.io = { __VA_ARGS__ }                                             \
+//     };                                                                      \
+//     break
+
 void
 art_coro_state_init(ARTCoroState *ctx);
 

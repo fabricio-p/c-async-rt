@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <string.h>
+#include <errno.h>
 
 #include "async.h"
 #include "logging.h"
@@ -21,12 +23,14 @@ int
 art_context_init(ARTContext *ctx, ARTContextSettings const *settings) {
     ctx->main_thread_id = pthread_self();
     ctx->scheds_size = settings->sched_count;
-    ctx->scheds_items = calloc(ctx->scheds_size, sizeof(ARTCoroDeque));
+    ctx->scheds_items = calloc(ctx->scheds_size, sizeof(ARTScheduler));
+    LOG_INFO(
+        "%" PRIuMAX " schedulers initialized (%p)\n",
+        ctx->scheds_size,
+        (void *) ctx->scheds_items
+    );
     for (size_t i = 0; i < ctx->scheds_size; i++) {
         art_scheduler_init(ctx, &ctx->scheds_items[i]);
-        if (i != 0 || !settings->use_current_thread) {
-            art_scheduler_start(&ctx->scheds_items[i]);
-        }
     }
     if (settings->use_current_thread) {
         ctx->scheds_items[0].thread_id = ctx->main_thread_id;
@@ -40,6 +44,17 @@ art_context_init(ARTContext *ctx, ARTContextSettings const *settings) {
     );
 
     return 0;
+}
+
+void
+art_context_run(ARTContext *ctx) {
+    size_t i = 0;
+    if (pthread_equal(ctx->main_thread_id, ctx->scheds_items[0].thread_id)) {
+        i = 1;
+    }
+    for (; i < ctx->scheds_size; i++) {
+        art_scheduler_start(&ctx->scheds_items[i]);
+    }
 }
 
 ARTCoro *
@@ -96,8 +111,17 @@ art_scheduler_init(ARTContext *ctx, ARTScheduler *sched) {
     art_coro_deque_init(&sched->io_q);
     art_coro_deque_init(&sched->active_qs[0]);
     art_coro_deque_init(&sched->active_qs[1]);
+    DARRAY_INIT(sched, epoll_evs_, struct epoll_event, 16);
+    sched->epoll_evs_size = sched->epoll_evs_capacity;
     sched->epoll_fd = epoll_create1(0);
-    DARRAY_INIT(sched, epoll_evs_, struct epoll_event, 10);
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = sched->ctx->global_q.eventfd;
+    epoll_ctl(
+        sched->epoll_fd, EPOLL_CTL_ADD, sched->ctx->global_q.eventfd, &ev
+    );
+
     // TODO: Maybe use some id thing
     LOG_INFO(
         "Scheduler initialized (id=%" PRIuMAX ")\n",
@@ -113,11 +137,13 @@ art_scheduler_loop(ARTScheduler *sched) {
     );
 #define PIPE_BATCH_SIZE 10
     pthread_cleanup_push((void (*) (void *))art_scheduler_cleanup, sched);
+
     for (;;) {
         pthread_testcancel();
         ARTCoroDeque *active_q;
         ARTCoroDeque *buffer_q;
         ARTCoro *coro;
+        bool global_queue_ready = true;
 
         bool queues_swapped = art_scheduler_next_task(
             &coro,
@@ -130,7 +156,10 @@ art_scheduler_loop(ARTScheduler *sched) {
         }
 
         ARTCoroResult coro_res = art_coro_run(sched, coro);
-        if (coro_res.status == ART_CO_DONE && coro->flags & (1 << ART_CO_FREE)) {
+        if (
+            coro_res.status == ART_CO_DONE
+            && coro->flags & (1 << ART_CO_FREE)
+        ) {
             art_coro_cleanup(coro);
             // TODO: Don't do this directly like this
             free(coro);
@@ -145,30 +174,53 @@ art_scheduler_loop(ARTScheduler *sched) {
                 ev.events |= EPOLLONESHOT;
             }
             ev.data.ptr = coro;
-            epoll_ctl(sched->epoll_fd, EPOLL_CTL_ADD, coro_res.d.io.fd, &ev);
+            int rv = epoll_ctl(
+                sched->epoll_fd, EPOLL_CTL_ADD, coro_res.d.io.fd, &ev
+            );
+            if (rv < 0) {
+                LOG_ERROR("epoll_ctl failed(%d): %s\n", errno, strerror(errno));
+            }
             art_coro_deque_push_back(&sched->io_q, coro);
         }
+
         if (coro_res.status != ART_CO_DONE) {
             art_coro_deque_push_back(buffer_q, coro);
+        } else {
+            LOG_INFO("Coroutine (id=%" PRIuMAX ") done\n", coro->id);
         }
 
 poll_events:
-        if (queues_swapped) {
+        if (queues_swapped && sched->io_q.first != NULL) {
             int count = epoll_wait(
                 sched->epoll_fd,
                 sched->epoll_evs_items,
                 sched->epoll_evs_size,
-                1
+                1000 * 2
             );
+            LOG_INFO("%d events\n", count);
+            if (count < 0) {
+                LOG_ERROR(
+                    "epoll_wait failed(%d): %s\n",
+                    errno,
+                    strerror(errno)
+                );
+                break;
+            }
             for (int i = 0; i < count; i++) {
                 struct epoll_event *ev = &sched->epoll_evs_items[i];
+                // if (ev->data.fd == sched->ctx->global_q.eventfd) {
+                //     global_queue_ready = true;
+                //     continue;
+                // }
                 ARTCoro *coro = ev->data.ptr;
                 art_coro_deque_pluck(&sched->io_q, coro);
                 art_coro_deque_push_back(buffer_q, coro);
             }
         }
 
-        {
+        if (global_queue_ready) {
+            char _b[sizeof(uint64_t)];
+            read(sched->ctx->global_q.eventfd, _b, sizeof(_b));
             art_coro_gqueue_lock(&sched->ctx->global_q);
             size_t count = 0;
             for (;;) {
@@ -177,9 +229,17 @@ poll_events:
                     buffer_q,
                     1 // PIPE_BATCH_SIZE
                 );
-                if (coro == NULL && count == 0) {
+                if (
+                    coro == NULL
+                    && count == 0
+                    && sched->io_q.first == NULL
+                    && sched->wait_q.first == NULL
+                ) {
                     art_coro_gqueue_wait(&sched->ctx->global_q);
                     continue;
+                }
+                if (count != 0) {
+                    LOG_INFO("Global queue fetched %" PRIuMAX " coroutines\n", count);
                 }
                 break;
             }
@@ -272,7 +332,7 @@ art_scheduler_next_task(
     *active_q = &sched->active_qs[active_idx];
     *buffer_q = &sched->active_qs[buffer_idx];
     *coro = art_coro_deque_pop_front_lock(*active_q);
-    if (coro == NULL) {
+    if (*coro == NULL) {
         active_idx = !active_idx;
         buffer_idx = !buffer_idx;
         atomic_store_explicit(

@@ -1,6 +1,7 @@
 #ifndef ART_QUEUES_H
 #define ART_QUEUES_H
 #include <pthread.h>
+#include <sys/eventfd.h>
 #include "coro.h"
 
 typedef struct art_coro_gqueue_t {
@@ -9,6 +10,7 @@ typedef struct art_coro_gqueue_t {
 
     pthread_mutex_t mtx;
     pthread_cond_t cond;
+    int eventfd;
 } ARTCoroGQueue;
 
 typedef struct art_coro_deque_t {

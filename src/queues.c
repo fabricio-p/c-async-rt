@@ -1,4 +1,6 @@
+#include <stdio.h>
 #include "queues.h"
+#include "logging.h"
 
 static inline void
 art_coro_push_single(ARTCoroGQueue *gqueue, ARTCoro *coro);
@@ -7,6 +9,7 @@ void
 art_coro_gqueue_init(ARTCoroGQueue *gqueue) {
     pthread_mutex_init(&gqueue->mtx, NULL);
     pthread_cond_init(&gqueue->cond, NULL);
+    gqueue->eventfd = eventfd(0, EFD_SEMAPHORE);
     gqueue->first = NULL;
     gqueue->last = NULL;
 }
@@ -17,6 +20,8 @@ art_coro_gqueue_push(ARTCoroGQueue *gqueue, ARTCoro **coros, size_t n) {
     for (size_t i = 0; i < n; i++) {
         art_coro_push_single(gqueue, coros[i]);
     }
+    eventfd_write(gqueue->eventfd, 4);
+    LOG_INFO_("WROTE TO EVENTFD MFFFFF\n");
     pthread_mutex_unlock(&gqueue->mtx);
     pthread_cond_broadcast(&gqueue->cond);
 }

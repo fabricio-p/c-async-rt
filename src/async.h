@@ -60,6 +60,8 @@ art_scheduler_cleanup(ARTScheduler *sched);
 
 int
 art_context_init(ARTContext *ctx, ARTContextSettings const *settings);
+void
+art_context_run(ARTContext *ctx);
 ARTCoro
 *art_context_new_coro(ARTContext *ctx);
 void
