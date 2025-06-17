@@ -20,8 +20,8 @@ art_coro_gqueue_push(ARTCoroGQueue *gqueue, ARTCoro **coros, size_t n) {
     for (size_t i = 0; i < n; i++) {
         art_coro_push_single(gqueue, coros[i]);
     }
-    eventfd_write(gqueue->eventfd, 4);
-    LOG_INFO_("WROTE TO EVENTFD MFFFFF\n");
+    // eventfd_write(gqueue->eventfd, 4);
+    // LOG_INFO_("WROTE TO EVENTFD MFFFFF\n");
     pthread_mutex_unlock(&gqueue->mtx);
     pthread_cond_broadcast(&gqueue->cond);
 }
@@ -30,7 +30,6 @@ art_coro_gqueue_push(ARTCoroGQueue *gqueue, ARTCoro **coros, size_t n) {
 ARTCoro *
 art_coro_gqueue_pop(ARTCoroGQueue *gqueue) {
     ARTCoro *coro = NULL;
-    // pthread_mutex_lock(&gqueue->mtx);
     if (gqueue->first == NULL) {
         goto end;
     } else {
@@ -41,7 +40,6 @@ art_coro_gqueue_pop(ARTCoroGQueue *gqueue) {
         }
         coro->next = NULL;
     }
-    // pthread_mutex_unlock(&gqueue->mtx);
 end:
     return coro;
 }
@@ -163,7 +161,6 @@ art_coro_deque_pluck(ARTCoroDeque *deque, ARTCoro *coro) {
     } else {
         coro->next->prev = coro->prev;
     }
-
     coro->prev = NULL;
     coro->next = NULL;
 }

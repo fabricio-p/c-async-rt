@@ -8,7 +8,7 @@ struct art_scheduler_t;
 typedef enum coroutine_status_t {
     ART_CO_DONE,
     ART_CO_INITIALIZED,
-    ART_CO_WAITING,
+    ART_CO_RUNNING,
     ART_CO_POLL_IO_READ,
     ART_CO_POLL_IO_WRITE,
 } ARTCoroStatus;
@@ -95,7 +95,7 @@ enum {
 
 #define ART_CO_YIELD(stage_)                                                \
     return (ARTCoroResult) {                                                \
-        .status = ART_CO_WAITING,                                           \
+        .status = ART_CO_RUNNING,                                           \
         .stage = stage_                                                     \
     };
 
@@ -139,14 +139,14 @@ enum {
 #define ART_CO_POLL_IO_LOOP_END(stage_)                                     \
     return res_##stage_
 
-// #define ART_CO_POLL_IO_LOOP_BREAK(stage_, action_, ...)                      \
-//     ART_CO_STAGE(stage_);                                                   \
-//     ARTCoroResult res_##stage_ = (ARTCoroResult) {                          \
-//         .status = ART_CO_POLL_IO_##action_,                                 \
-//         .stage = stage_,                                                    \
-//         .d.io = { __VA_ARGS__ }                                             \
-//     };                                                                      \
-//     break
+/*#define ART_CO_POLL_IO_LOOP_BREAK(stage_, action_, ...)                      \
+    ART_CO_STAGE(stage_);                                                   \
+    ARTCoroResult res_##stage_ = (ARTCoroResult) {                          \
+        .status = ART_CO_POLL_IO_##action_,                                 \
+        .stage = stage_,                                                    \
+        .d.io = { __VA_ARGS__ }                                             \
+    };                                                                      \
+    break*/
 
 void
 art_coro_state_init(ARTCoroState *ctx);

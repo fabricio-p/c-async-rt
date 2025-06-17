@@ -115,12 +115,12 @@ art_scheduler_init(ARTContext *ctx, ARTScheduler *sched) {
     sched->epoll_evs_size = sched->epoll_evs_capacity;
     sched->epoll_fd = epoll_create1(0);
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = sched->ctx->global_q.eventfd;
-    epoll_ctl(
-        sched->epoll_fd, EPOLL_CTL_ADD, sched->ctx->global_q.eventfd, &ev
-    );
+    // struct epoll_event ev;
+    // ev.events = EPOLLIN;
+    // ev.data.fd = sched->ctx->global_q.eventfd;
+    // epoll_ctl(
+    //     sched->epoll_fd, EPOLL_CTL_ADD, sched->ctx->global_q.eventfd, &ev
+    // );
 
     // TODO: Maybe use some id thing
     LOG_INFO(
@@ -156,20 +156,25 @@ art_scheduler_loop(ARTScheduler *sched) {
         }
 
         ARTCoroResult coro_res = art_coro_run(sched, coro);
-        if (
-            coro_res.status == ART_CO_DONE
-            && coro->flags & (1 << ART_CO_FREE)
-        ) {
-            art_coro_cleanup(coro);
-            // TODO: Don't do this directly like this
-            free(coro);
-        } else if (
-            coro_res.status == ART_CO_POLL_IO_READ
-            || coro_res.status == ART_CO_POLL_IO_WRITE
-        ) {
+        switch (coro_res.status) {
+        case ART_CO_INITIALIZED: break;
+
+        case ART_CO_DONE:
+        {
+            if (coro->flags & (1 << ART_CO_FREE)) {
+                LOG_INFO("Coroutine (id=%" PRIuMAX ") done\n", coro->id);
+                art_coro_cleanup(coro);
+                free(coro);
+            }
+        } break;
+
+        case ART_CO_POLL_IO_READ:
+        case ART_CO_POLL_IO_WRITE:
+        {
             struct epoll_event ev;
             ev.events =
                 coro_res.status == ART_CO_POLL_IO_READ ? EPOLLIN : EPOLLOUT;
+            ev.events |= EPOLLET;
             if (coro_res.d.io.once) {
                 ev.events |= EPOLLONESHOT;
             }
@@ -181,16 +186,15 @@ art_scheduler_loop(ARTScheduler *sched) {
                 LOG_ERROR("epoll_ctl failed(%d): %s\n", errno, strerror(errno));
             }
             art_coro_deque_push_back(&sched->io_q, coro);
-        }
+        } break;
 
-        if (coro_res.status != ART_CO_DONE) {
+        case ART_CO_RUNNING:
             art_coro_deque_push_back(buffer_q, coro);
-        } else {
-            LOG_INFO("Coroutine (id=%" PRIuMAX ") done\n", coro->id);
+            break;
         }
 
 poll_events:
-        if (queues_swapped && sched->io_q.first != NULL) {
+        if (queues_swapped/* && sched->io_q.first != NULL*/) {
             int count = epoll_wait(
                 sched->epoll_fd,
                 sched->epoll_evs_items,
@@ -213,21 +217,27 @@ poll_events:
                 //     continue;
                 // }
                 ARTCoro *coro = ev->data.ptr;
+                LOG_INFO(
+                    "[id=%" PRIuMAX "] Received io event for coroutine (id=%"
+                    PRIuMAX ")\n",
+                    sched - sched->ctx->scheds_items,
+                    coro->id
+                );
                 art_coro_deque_pluck(&sched->io_q, coro);
                 art_coro_deque_push_back(buffer_q, coro);
             }
         }
 
         if (global_queue_ready) {
-            char _b[sizeof(uint64_t)];
-            read(sched->ctx->global_q.eventfd, _b, sizeof(_b));
+            // char _b[sizeof(uint64_t)];
+            // read(sched->ctx->global_q.eventfd, _b, sizeof(_b));
             art_coro_gqueue_lock(&sched->ctx->global_q);
             size_t count = 0;
             for (;;) {
                 count = art_coro_gqueue_fetch_batch(
                     &sched->ctx->global_q,
                     buffer_q,
-                    1 // PIPE_BATCH_SIZE
+                    PIPE_BATCH_SIZE
                 );
                 if (
                     coro == NULL
@@ -239,7 +249,12 @@ poll_events:
                     continue;
                 }
                 if (count != 0) {
-                    LOG_INFO("Global queue fetched %" PRIuMAX " coroutines\n", count);
+                    LOG_INFO(
+                        "[id=%" PRIuMAX "] Global queue fetched %"
+                        PRIuMAX " coroutines\n",
+                        sched - sched->ctx->scheds_items,
+                        count
+                    );
                 }
                 break;
             }
