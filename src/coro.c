@@ -14,6 +14,8 @@ art_coro_state_init(ARTCoroState *ctx) {
 void
 art_coro_init(ARTCoro *coro, ARTCoroFunctionPtr fn, void *arg, size_t flags) {
     coro->id = atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
+    coro->prev = NULL;
+    coro->next = NULL;
     coro->fn = fn;
     coro->flags = flags;
     coro->stage = 0;

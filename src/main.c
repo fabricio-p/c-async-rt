@@ -30,6 +30,63 @@ typedef struct {
     char const *port;
 } RequestInfo;
 
+int
+client_connect_to(RequestInfo const *info) {
+    int socket_fd = -1;
+
+    struct addrinfo hints;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *server_info;
+    int errcode = getaddrinfo(
+        info->address,
+        info->port,
+        &hints,
+        &server_info
+    );
+    if (errcode != 0) {
+        LOG_INFO("getaddrinfo[client]: %s\n", gai_strerror(errcode));
+        return -1;
+    }
+
+    struct addrinfo *p = server_info;
+    for (; p != NULL; p = p->ai_next) {
+        int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd == -1) {
+            LOG_INFO_("[client]: failed socket\n");
+            continue;
+        }
+
+        if (connect(fd, p->ai_addr, p->ai_addrlen) == -1) {
+            LOG_INFO_("[client]: failed connect\n");
+            continue;
+        }
+
+        socket_fd = fd;
+        break;
+    }
+
+    if (p == NULL) {
+        LOG_INFO_("[client]: failed to find address to connect to\n");
+        return -1;
+    }
+
+    char s[INET6_ADDRSTRLEN];
+    inet_ntop(
+        p->ai_family,
+        get_in_addr((struct sockaddr *)p->ai_addr),
+        s,
+        sizeof(s)
+    );
+    LOG_INFO("[client]: connecting to %s\n", s);
+    freeaddrinfo(server_info);
+
+    return socket_fd;
+}
+
 ART_DEFINE_CO(do_client_stuff) {
     typedef struct {
         int socket;
@@ -42,67 +99,20 @@ ART_DEFINE_CO(do_client_stuff) {
     } ART_CO_INIT_END();
 
     ART_CO_STAGE(STG_CONNECT) {
-        struct addrinfo hints;
-
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        struct addrinfo *server_info;
-        int errcode = getaddrinfo(
-            coro_data->req_info.address,
-            coro_data->req_info.port,
-            &hints,
-            &server_info
-        );
-        if (errcode != 0) {
-            LOG_INFO("getaddrinfo[client]: %s\n", gai_strerror(errcode));
+        coro_data->socket = client_connect_to(&coro_data->req_info);
+        if (coro_data->socket == -1) {
             ART_CO_RETURN(-1);
         }
-
-        struct addrinfo *p = server_info;
-        for (; p != NULL; p = p->ai_next) {
-            int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (fd == -1) {
-                LOG_INFO_("[client]: failed socket\n");
-                continue;
-            }
-
-            if (connect(fd, p->ai_addr, p->ai_addrlen) == -1) {
-                LOG_INFO_("[client]: failed connect\n");
-                continue;
-            }
-
-            coro_data->socket = fd;
-            break;
-        }
-
-        if (p == NULL) {
-            LOG_INFO_("[client]: failed to find address to connect to\n");
-            ART_CO_RETURN(-1);
-        }
-
-        char s[INET6_ADDRSTRLEN];
-        inet_ntop(
-            p->ai_family,
-            get_in_addr((struct sockaddr *)p->ai_addr),
-            s,
-            sizeof(s)
-        );
-        LOG_INFO("[client]: connecting to %s\n", s);
-        freeaddrinfo(server_info);
-        // ART_CO_YIELD(STG_SEND);
     }
 
     ART_CO_POLL_IO(STG_SEND, WRITE, .once = true, .fd = coro_data->socket) {
         char const msg[] = "ping";
         ssize_t n = send(coro_data->socket, msg, sizeof(msg), 0);
         if (n < (ssize_t)sizeof(msg)) {
-            LOG_ERROR("Sent only %" PRIiMAX "bytes\n", n);
+            LOG_ERROR("send[client]: only %" PRIiMAX "bytes\n", n);
         } else {
-            LOG_INFO_("Sent ping\n");
+            LOG_INFO_("send[client]: ping\n");
         }
-        // ART_CO_YIELD(STG_RECV);
     }
 
     ART_CO_POLL_IO(STG_RECV, READ, .once = true, .fd = coro_data->socket) {
@@ -110,13 +120,14 @@ ART_DEFINE_CO(do_client_stuff) {
         char buffer[BUFFER_SIZE];
         ssize_t n = recv(coro_data->socket, buffer, BUFFER_SIZE - 1, 0);
         buffer[n] = 0;
-        LOG_INFO("received[client]: (%" PRIiMAX "): %.*s\n", n, (int)n, buffer);
+        LOG_INFO("recv[client]: (%" PRIiMAX "): %.*s\n", n, (int)n, buffer);
         ART_CO_YIELD(STG_CLOSE);
 #undef BUFFER_SIZE
     }
 
     ART_CO_STAGE(STG_CLOSE) {
         close(coro_data->socket);
+        LOG_INFO_("close[client]");
     }
 
     ART_CO_END();
@@ -149,6 +160,7 @@ ART_DEFINE_CO(do_handler_stuff) {
         if (strncmp(msg, "ping", n) != 0) {
             ART_CO_YIELD(STG_CLOSE);
         }
+        LOG_INFO_("recv[handler]: pongin'\n");
 #undef BUFFER_SIZE
     }
 
@@ -162,6 +174,7 @@ ART_DEFINE_CO(do_handler_stuff) {
                 strerror(errno)
             );
         }
+        LOG_INFO_("send[handler]: pong\n");
         ART_CO_YIELD(STG_CLOSE);
     }
 
@@ -268,7 +281,7 @@ ART_DEFINE_CO(do_server_stuff) {
             LOG_INFO_("[server]: failed accept\n");
         }
 
-        char s[INET6_ADDRSTRLEN] = "FUCK";
+        char s[INET6_ADDRSTRLEN];
         inet_ntop(
             their_addr.ss_family,
             get_in_addr((struct sockaddr *)&their_addr),
@@ -341,23 +354,25 @@ int main() {
     art_context_init(&ctx, &ctx_settings);
 
     srand48(time(NULL));
-    ARTCoro *thing_coros[] = {
-        art_context_new_coro(&ctx),
-        art_context_new_coro(&ctx),
-        art_context_new_coro(&ctx),
-        art_context_new_coro(&ctx),
-    };
+    // ARTCoro *thing_coros[] = {
+    //     art_context_new_coro(&ctx),
+    //     art_context_new_coro(&ctx),
+    //     art_context_new_coro(&ctx),
+    //     art_context_new_coro(&ctx),
+    // };
     ARTCoro *client_coros[] = {
+        art_context_new_coro(&ctx),
         art_context_new_coro(&ctx),
     };
     ARTCoro *server_coro = art_context_new_coro(&ctx);
 
     RequestInfo req_infos[] = {
+        { .address = "127.0.0.1", .port = "4545" },
         { .address = "127.0.0.1", .port = "4545" }
     };
-    for (size_t i = 0; i < COUNTOF(thing_coros); i++) {
-        art_coro_init(thing_coros[i], do_thing, &i, 1 << ART_CO_FREE);
-    }
+    // for (size_t i = 0; i < COUNTOF(thing_coros); i++) {
+    //     art_coro_init(thing_coros[i], do_thing, &i, 1 << ART_CO_FREE);
+    // }
     art_coro_init(server_coro, do_server_stuff, "4545", 1 << ART_CO_FREE);
     for (size_t i = 0; i < COUNTOF(client_coros); i++) {
         art_coro_init(
@@ -370,7 +385,7 @@ int main() {
 
     sleep(2);
     LOG_INFO_("Pushing coroutines to global queue\n\n\n");
-    art_context_run_coros(&ctx, thing_coros, COUNTOF(thing_coros));
+    // art_context_run_coros(&ctx, thing_coros, COUNTOF(thing_coros));
     art_context_run_coros(&ctx, &server_coro, 1);
     sleep(1);
     art_context_run_coros(&ctx, client_coros, COUNTOF(client_coros));

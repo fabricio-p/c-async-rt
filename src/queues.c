@@ -2,8 +2,8 @@
 #include "queues.h"
 #include "logging.h"
 
-static inline void
-art_coro_push_single(ARTCoroGQueue *gqueue, ARTCoro *coro);
+// static inline void
+// art_coro_push_single(ARTCoroGQueue *gqueue, ARTCoro *coro);
 
 void
 art_coro_gqueue_init(ARTCoroGQueue *gqueue) {
@@ -16,14 +16,28 @@ art_coro_gqueue_init(ARTCoroGQueue *gqueue) {
 
 void
 art_coro_gqueue_push(ARTCoroGQueue *gqueue, ARTCoro **coros, size_t n) {
+    if (n == 0) { return; }
+
     pthread_mutex_lock(&gqueue->mtx);
-    for (size_t i = 0; i < n; i++) {
-        art_coro_push_single(gqueue, coros[i]);
+    size_t i = 0;
+    ARTCoro *last = gqueue->last;
+    if (last == NULL) {
+        last = coros[0];
+        gqueue->first = last;
+        i = 1;
     }
+    for (; i < n; i++) {
+        ARTCoro *coro = coros[i];
+        last->next = coro;
+        coro->prev = last;
+        last = coro;
+        // art_coro_push_single(gqueue, coros[i]);
+    }
+    gqueue->last = last;
     // eventfd_write(gqueue->eventfd, 4);
     // LOG_INFO_("WROTE TO EVENTFD MFFFFF\n");
     pthread_mutex_unlock(&gqueue->mtx);
-    pthread_cond_broadcast(&gqueue->cond);
+    pthread_cond_signal(&gqueue->cond);
 }
 
 
@@ -31,16 +45,14 @@ ARTCoro *
 art_coro_gqueue_pop(ARTCoroGQueue *gqueue) {
     ARTCoro *coro = NULL;
     if (gqueue->first == NULL) {
-        goto end;
-    } else {
-        coro = gqueue->first;
-        gqueue->first = coro->next;
-        if (gqueue->first == NULL) {
-            gqueue->last = NULL;
-        }
-        coro->next = NULL;
+        return NULL;
     }
-end:
+    coro = gqueue->first;
+    gqueue->first = coro->next;
+    if (gqueue->last == coro) {
+        gqueue->last = NULL;
+    }
+    coro->next = NULL;
     return coro;
 }
 
@@ -84,17 +96,17 @@ art_coro_gqueue_cleanup(ARTCoroGQueue *gqueue) {
     gqueue->last = NULL;
 }
 
-static inline void
-art_coro_push_single(ARTCoroGQueue *gqueue, ARTCoro *coro) {
-    if (gqueue->first == NULL) {
-        gqueue->first = coro;
-        gqueue->last = coro;
-    } else {
-        gqueue->last->next = coro;
-        coro->prev = gqueue->last;
-        gqueue->last = coro;
-    }
-}
+// static inline void
+// art_coro_push_single(ARTCoroGQueue *gqueue, ARTCoro *coro) {
+//     if (gqueue->first == NULL) {
+//         gqueue->first = coro;
+//         gqueue->last = coro;
+//     } else {
+//         gqueue->last->next = coro;
+//         coro->prev = gqueue->last;
+//         gqueue->last = coro;
+//     }
+// }
 
 void
 art_coro_deque_init(ARTCoroDeque *deque) {
