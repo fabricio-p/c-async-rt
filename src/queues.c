@@ -37,7 +37,7 @@ art_coro_gqueue_push(ARTCoroGQueue *gqueue, ARTCoro **coros, size_t n) {
     // eventfd_write(gqueue->eventfd, 4);
     // LOG_INFO_("WROTE TO EVENTFD MFFFFF\n");
     pthread_mutex_unlock(&gqueue->mtx);
-    pthread_cond_signal(&gqueue->cond);
+    pthread_cond_broadcast(&gqueue->cond);
 }
 
 

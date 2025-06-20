@@ -9,9 +9,14 @@ typedef enum coroutine_status_t {
     ART_CO_DONE,
     ART_CO_INITIALIZED,
     ART_CO_RUNNING,
-    ART_CO_POLL_IO_READ,
-    ART_CO_POLL_IO_WRITE,
+    ART_CO_POLL_IO,
 } ARTCoroStatus;
+
+typedef enum coroutine_io_kind_t {
+    ART_IO_REGISTERED,
+    ART_IO_READ = 1 << 0,
+    ART_IO_WRITE = 1 << 1
+} ARTCoroIOKind;
 
 typedef struct coroutine_result_t {
     ARTCoroStatus status;
@@ -19,6 +24,7 @@ typedef struct coroutine_result_t {
     union {
         struct {
             int fd;
+            ARTCoroIOKind kind;
             bool once;
         } io;
     } d;
@@ -40,6 +46,7 @@ typedef ARTCoroResult (*ARTCoroFunctionPtr)(
 
 typedef struct coroutine_t {
     DOUBLE_LIST_PARTS(, struct coroutine_t);
+    DOUBLE_LIST_PARTS(free_, struct coroutine_t);
     size_t flags;
 
     ARTCoroFunctionPtr fn;
@@ -120,24 +127,24 @@ enum {
     ART_CO_STAGE(stage_);                                                   \
     if ((coro_)->state != ART_CO_DONE) { ART_CO_YIELD((stage_)); }
 
-#define ART_CO_POLL_IO(stage_, action_, ...)                                \
+#define ART_CO_POLL_IO_STAGE(stage_, action_, ...)                          \
     return (ARTCoroResult) {                                                \
-        .status = ART_CO_POLL_IO_##action_,                                 \
+        .status = ART_CO_POLL_IO,                                           \
         .stage = stage_,                                                    \
         .d.io = { __VA_ARGS__ }                                             \
     };                                                                      \
     ART_CO_STAGE(stage_)
 
 #define ART_CO_POLL_IO_LOOP_BEGIN(stage_, action_, ...)                     \
-    ART_CO_STAGE(stage_);                                                   \
-    ARTCoroResult res_##stage_ = (ARTCoroResult) {                          \
-        .status = ART_CO_POLL_IO_##action_,                                 \
-        .stage = stage_,                                                    \
-        .d.io = { __VA_ARGS__ }                                             \
-    };
+    ART_CO_POLL_IO_STAGE(stage_, action_, __VA_ARGS__)
 
 #define ART_CO_POLL_IO_LOOP_END(stage_)                                     \
-    return res_##stage_
+    return (ARTCoroResult) {                                                \
+        .status = ART_CO_POLL_IO,                                           \
+        .stage = stage_,                                                    \
+        .d.io.fd = -1,                                                      \
+        .d.io.kind = ART_IO_REGISTERED                                      \
+    }
 
 /*#define ART_CO_POLL_IO_LOOP_BREAK(stage_, action_, ...)                      \
     ART_CO_STAGE(stage_);                                                   \

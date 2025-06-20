@@ -74,9 +74,11 @@ art_context_register_cleanup(
     void (*fn)(OpaqueMemory),
     OpaqueMemory data
 ) {
-    ARTCleanupEntry *entry = DARRAY_PUSH(ctx, cleanups_, ARTCleanupEntry);
+    pthread_spin_lock(&ctx->cleanups.lock);
+    ARTCleanupEntry *entry = DARRAY_PUSH(&ctx->cleanups,, ARTCleanupEntry);
     entry->fn = fn;
     entry->data = data;
+    pthread_spin_unlock(&ctx->cleanups.lock);
 }
 
 void
@@ -90,16 +92,16 @@ art_context_join(ARTContext *ctx) {
 
 void
 art_context_cleanup(ARTContext *ctx) {
+    for (size_t i = 0; i < ctx->cleanups.size; i++) {
+        ctx->cleanups.items[i].fn(ctx->cleanups.items[i].data);
+    }
+    DARRAY_UNINIT(&ctx->cleanups,);
+
     for (size_t i = 0; i < ctx->scheds_size; i++) {
         art_scheduler_cancel(&ctx->scheds_items[i]);
         art_scheduler_cleanup(&ctx->scheds_items[i]);
     }
     free(ctx->scheds_items);
-
-    for (size_t i = 0; i < ctx->cleanups_size; i++) {
-        ctx->cleanups_items[i].fn(ctx->cleanups_items[i].data);
-    }
-    DARRAY_UNINIT(ctx, cleanups_);
 
     art_coro_gqueue_cleanup(&ctx->global_q);
 }
@@ -122,6 +124,7 @@ art_scheduler_init(ARTContext *ctx, ARTScheduler *sched) {
     //     sched->epoll_fd, EPOLL_CTL_ADD, sched->ctx->global_q.eventfd, &ev
     // );
 
+    sched->_fd_bitset = 0;
     // TODO: Maybe use some id thing
     LOG_INFO(
         "Scheduler initialized (id=%" PRIuMAX ")\n",
@@ -168,16 +171,21 @@ art_scheduler_loop(ARTScheduler *sched) {
             }
         } break;
 
-        case ART_CO_POLL_IO_READ:
-        case ART_CO_POLL_IO_WRITE:
+        case ART_CO_POLL_IO:
         {
-            struct epoll_event ev;
-            ev.events =
-                coro_res.status == ART_CO_POLL_IO_READ ? EPOLLIN : EPOLLOUT;
-            ev.events |= EPOLLET;
-            if (coro_res.d.io.once) {
-                ev.events |= EPOLLONESHOT;
+            if (coro_res.d.io.kind == ART_IO_REGISTERED) {
+                LOG_INFO(
+                    "[coro.id=%" PRIuMAX "] fd(%d) ART_IO_REGISTERED\n",
+                    coro->id,
+                    coro_res.d.io.fd
+                );
+                goto schedule_io;
             }
+            struct epoll_event ev;
+            ev.events |= EPOLLET;
+            ev.events |= coro_res.d.io.kind & ART_IO_READ ? EPOLLIN : 0;
+            ev.events |= coro_res.d.io.kind & ART_IO_WRITE ? EPOLLOUT : 0;
+            ev.events |= coro_res.d.io.once ? EPOLLONESHOT : 0;
             ev.data.ptr = coro;
             int rv = epoll_ctl(
                 sched->epoll_fd, EPOLL_CTL_ADD, coro_res.d.io.fd, &ev
@@ -185,6 +193,16 @@ art_scheduler_loop(ARTScheduler *sched) {
             if (rv < 0) {
                 LOG_ERROR("epoll_ctl failed(%d): %s\n", errno, strerror(errno));
             }
+            if (sched->_fd_bitset & (1 << coro_res.d.io.fd)) {
+                LOG_ERROR(
+                    "[coro.id=%" PRIuMAX "] fd(%d) already registered\n",
+                    coro->id,
+                    coro_res.d.io.fd
+                );
+            } else {
+                sched->_fd_bitset |= (1 << coro_res.d.io.fd);
+            }
+schedule_io:
             art_coro_deque_push_back(&sched->io_q, coro);
         } break;
 
@@ -194,7 +212,7 @@ art_scheduler_loop(ARTScheduler *sched) {
         }
 
 poll_events:
-        if (queues_swapped/* && sched->io_q.first != NULL*/) {
+        if (queues_swapped && sched->io_q.first != NULL) {
             int count = epoll_wait(
                 sched->epoll_fd,
                 sched->epoll_evs_items,

@@ -27,6 +27,8 @@ typedef struct art_scheduler_t {
 
     int epoll_fd;
     DARRAY_PARTS(epoll_evs_, struct epoll_event);
+
+    uint16_t _fd_bitset;
 } ARTScheduler;
 
 typedef struct art_context_settings_t {
@@ -41,7 +43,10 @@ typedef struct art_cleanup_entry_t {
 
 struct art_context_t {
     ARRAY_PARTS(scheds_, ARTScheduler);
-    DARRAY_PARTS(cleanups_, ARTCleanupEntry);
+    struct {
+        DARRAY_PARTS(, ARTCleanupEntry);
+        pthread_spinlock_t lock;
+    } cleanups;
     pthread_t main_thread_id;
 
     ARTCoroGQueue global_q;

@@ -1,0 +1,16 @@
+add_rules("mode.debug", "mode.release")
+
+target("tcp_chat")
+   set_kind("binary")
+   set_warnings("all", "error", "extra", "pedantic")
+   add_cxflags("-Wno-pointer-arith")
+   add_deps("async-rt", "async-rt:url")
+   add_files("src/server.c")
+
+target("tcp_chat_client")
+   set_kind("binary")
+   set_warnings("all", "error", "extra", "pedantic")
+   add_cxflags("-Wno-pointer-arith")
+   add_deps("async-rt", "async-rt:url")
+   add_deps("async-rt:url")
+   add_files("src/client.c")
