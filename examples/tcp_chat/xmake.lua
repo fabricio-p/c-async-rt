@@ -4,7 +4,7 @@ target("tcp_chat")
    set_kind("binary")
    set_warnings("all", "error", "extra", "pedantic")
    add_cxflags("-Wno-pointer-arith")
-   add_deps("async-rt", "async-rt:url")
+   add_deps("async-rt")
    add_files("src/server.c")
 
 target("tcp_chat_client")

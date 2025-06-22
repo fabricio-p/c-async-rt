@@ -31,9 +31,7 @@ typedef struct coroutine_result_t {
 } ARTCoroResult;
 
 typedef struct coroutine_state_t {
-    size_t r_size;
     size_t data_size;
-    OpaqueMemory ret;
     OpaqueMemory data;
 } ARTCoroState;
 
@@ -73,16 +71,13 @@ enum {
 #define _ART_CO_CASE_(c) case (c):
 
 // TODO: Better allocation bs
-#define ART_CO_INIT_BEGIN(r_type, data_type, arg_type)                      \
-    __attribute__((unused)) r_type *coro_result = _coro_state_->ret;        \
+#define ART_CO_INIT_BEGIN(data_type, arg_type)                              \
     __attribute__((unused)) data_type *coro_data =                          \
         (data_type *)_coro_state_->data;                                    \
     switch (_coro_stage_) {                                                 \
     _ART_CO_CASE_(0) {                                                      \
-        _coro_state_->r_size = sizeof(r_type);                              \
         _coro_state_->data_size = sizeof(data_type);                        \
         art_coro_state_init(_coro_state_);                                  \
-        coro_result = (r_type *)_coro_state_->ret;                          \
         coro_data = (data_type *)_coro_state_->data;                        \
         __attribute__((unused)) arg_type *coro_argument =                   \
             (arg_type *)_coro_arg_

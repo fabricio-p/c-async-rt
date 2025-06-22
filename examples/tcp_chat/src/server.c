@@ -17,7 +17,6 @@
 #include "coro.h"
 #include "err_utils.h"
 #include "logging.h"
-#include "url.h"
 
 void *get_in_addr(struct sockaddr *sa) {
     return
@@ -26,15 +25,13 @@ void *get_in_addr(struct sockaddr *sa) {
         : (void *) &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
-int char_range_len(CharRange cr) { return cr.end - cr.begin; }
-
 ART_DEFINE_CO(do_handler_stuff) {
     typedef struct {
         int fd;
     } State;
     enum { STG_RECV = 1, STG_SEND, STG_CLOSE };
 
-    ART_CO_INIT_BEGIN(void, State, int); {
+    ART_CO_INIT_BEGIN(State, int); {
         coro_data->fd = *coro_argument;
     } ART_CO_INIT_END();
 
@@ -159,7 +156,7 @@ server_cleanup(void *arg) {
 ART_DEFINE_CO(do_server_stuff) {
     enum { STG_START = 1, STG_ACCEPT };
 
-    ART_CO_INIT_BEGIN(void, State, char const); {
+    ART_CO_INIT_BEGIN(State, char const); {
         coro_data->port = coro_argument;
     } ART_CO_INIT_END();
 
@@ -176,8 +173,6 @@ ART_DEFINE_CO(do_server_stuff) {
             server_cleanup,
             coro_data
         );
-
-        ART_CO_YIELD(STG_ACCEPT);
     }
 
     ART_CO_POLL_IO_LOOP_BEGIN(
@@ -215,25 +210,8 @@ ART_DEFINE_CO(do_server_stuff) {
     ART_CO_END();
 }
 
-CharRange char_range_lit(char const *s) {
-    CharRange cr;
-    cr.begin = s;
-    cr.end = s + strlen(s);
-    return cr;
-}
-#define CHAR_RANGE_FMT(cr) char_range_len(cr), cr.begin
-
 #define COUNTOF(a) (sizeof(a) / sizeof((a)[0]))
 int main() {
-    ARTUrl url = art_url_parse(char_range_lit("http://127.0.0.1:4545/"));
-    LOG_INFO(
-        "(ARTUrl) { .scheme = %.*s, .host = %.*s, .path = %.*s, .port = %"
-        PRIu16 " }\n",
-        CHAR_RANGE_FMT(url.scheme),
-        CHAR_RANGE_FMT(url.host),
-        CHAR_RANGE_FMT(url.path),
-        url.port
-    );
     int status = 0;
     ARTContext ctx;
     ARTContextSettings ctx_settings;
@@ -247,11 +225,11 @@ int main() {
     art_coro_init(server_coro, do_server_stuff, "4545", 1 << ART_CO_FREE);
 
     sleep(1);
+    LOG_INFO_("Running context\n\n\n");
+    art_context_run(&ctx);
+    sleep(1);
     LOG_INFO_("Pushing server coroutine to global queue\n");
     art_context_run_coros(&ctx, &server_coro, 1);
-    sleep(1);
-    art_context_run(&ctx);
-    LOG_INFO_("Running context\n\n\n");
     art_context_join(&ctx);
     return status;
 }

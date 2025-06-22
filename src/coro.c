@@ -7,7 +7,6 @@ static atomic_uintmax_t counter = 0;
 
 void
 art_coro_state_init(ARTCoroState *ctx) {
-    ctx->ret = ctx->r_size != 0 ? malloc(ctx->r_size) : NULL;
     ctx->data = ctx->data_size != 0 ? malloc(ctx->data_size) : NULL;
 }
 
@@ -20,8 +19,6 @@ art_coro_init(ARTCoro *coro, ARTCoroFunctionPtr fn, void *arg, size_t flags) {
     coro->flags = flags;
     coro->stage = 0;
     coro->state.data = NULL;
-    coro->state.ret = NULL;
-    coro->state.r_size = 0;
     coro->state.data_size = 0;
     ARTCoroResult res = fn(NULL, &coro->state, arg, 0);
     coro->status = res.status;
@@ -34,10 +31,6 @@ art_coro_cleanup(ARTCoro *coro) {
     if (coro->state.data != NULL) {
         free(coro->state.data);
         coro->state.data = NULL;
-    }
-    if (coro->state.ret != NULL) {
-        free(coro->state.ret);
-        coro->state.ret = NULL;
     }
     LOG_INFO("ARTCoro (%" PRIuMAX ") cleaned up\n", coro->id);
 }

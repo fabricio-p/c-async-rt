@@ -7,7 +7,7 @@ art_ds_darray_grow(
     size_t element_size
 ) {
     size_t new_cap = *capacity == 0 ? 8 : *capacity * 2;
-    void *new_data = realloc(data, new_cap * element_size);
+    void *new_data = realloc(*data, new_cap * element_size);
     if (new_data == NULL) {
         return 1;
     }

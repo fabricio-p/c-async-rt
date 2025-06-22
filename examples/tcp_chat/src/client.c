@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 #include "err_utils.h"
 #include "logging.h"
@@ -99,7 +100,13 @@ CharRange char_range_lit(char const *s) {
 #define COUNTOF(a) (sizeof(a) / sizeof((a)[0]))
 int main() {
     ARTUrl url = art_url_parse(char_range_lit("http://127.0.0.1:4545/"));
-    int fd = client_connect_to(&url);
+    int
+        stdin_fd = fileno(stdin)
+    ,   stderr_fd = fileno(stderr)
+    ,   stdout_fd = fileno(stdout)
+    ,   fd = client_connect_to(&url)
+    ;
+
     LOG_INFO(
         "(ARTUrl) { .scheme = %.*s, .host = %.*s, .path = %.*s, .port = %"
         PRIu16 " }\n",
@@ -108,6 +115,63 @@ int main() {
         CHAR_RANGE_FMT(url.path),
         url.port
     );
+    if (fd == -1) {
+        LOG_INFO_("[client]: failed to connect\n");
+        return -1;
+    }
+    LOG_INFO("fd = %d\n", fd);
+
+    struct pollfd poll_fds[2] = {0};
+    poll_fds[0].fd = stdin_fd;
+    poll_fds[0].events = POLLIN;
+    poll_fds[1].fd = fd;
+    poll_fds[1].events = POLLIN;
+
+#define BUFFER_SIZE 0x1000
+    char buf[BUFFER_SIZE];
+    for (;;) {
+        write(stderr_fd, "> ", 2);
+        int ready = poll(poll_fds, 2, -1);
+        if (ready < 0) {
+            LOG_ERROR(
+                "poll[client]: failed with (%d) \"%s\"\n",
+                ready,
+                strerror(errno)
+            );
+            close(fd);
+            return -1;
+        }
+
+        if (ready == 0) {
+            LOG_INFO_("poll[client]: timeout\n");
+            continue;
+        }
+
+        if (poll_fds[0].revents & POLLIN) {
+            int n = read(stdin_fd, buf, BUFFER_SIZE);
+            if (n < 0) { LOG_INFO_("read[client]: stdin failed\n"); break; }
+            if (n == 0) { LOG_INFO_("read[client]: stdin EOF\n"); continue; }
+            if (n == 1) {
+                LOG_INFO_("NIGGA\n");
+                /// write(stderr_fd, "\n", 1);
+                continue;
+            }
+            send(fd, buf, n - 1, 0);
+        }
+
+        if (poll_fds[1].revents & POLLIN) {
+            int n = recv(fd, buf, BUFFER_SIZE, 0);
+            if (n <= 0) { break; }
+            write(stderr_fd, "\r<< ", 4);
+            write(stdout_fd, buf, n);
+            write(stderr_fd, "\n", 1);
+        }
+
+        if (poll_fds[1].revents & (POLLHUP | POLLERR)) {
+            LOG_INFO_("poll[client]: connection closed\n");
+            break;
+        }
+    }
 
     return 0;
 }

@@ -38,6 +38,11 @@ art_context_init(ARTContext *ctx, ARTContextSettings const *settings) {
     art_coro_gqueue_init(&ctx->global_q);
     LOG_INFO_("Global queue initialized\n");
 
+    pthread_spin_init(
+        &ctx->cleanups.lock,
+        PTHREAD_PROCESS_PRIVATE
+    );
+
     LOG_INFO(
         "Context initialized (%" PRIuMAX " schedulers)\n",
         ctx->scheds_size
@@ -154,11 +159,27 @@ art_scheduler_loop(ARTScheduler *sched) {
             &active_q,
             &buffer_q
         );
+        LOG_INFO(
+            "active_q->first = %p, buffer_q->first = %p\n",
+            (void *)active_q->first,
+            (void *)buffer_q->first
+        );
         if (coro == NULL) {
             goto poll_events;
         }
+        LOG_INFO("coro.id = %" PRIuMAX "\n", coro->id);
 
         ARTCoroResult coro_res = art_coro_run(sched, coro);
+        LOG_INFO(
+            "[coro.id=%" PRIuMAX "] status=%d, stage=%" PRIuMAX "\n",
+            coro->id,
+            coro_res.status,
+            coro_res.stage
+        );
+        if (sched->ctx->global_q.first == NULL) {
+            global_queue_ready = false;
+        }
+
         switch (coro_res.status) {
         case ART_CO_INITIALIZED: break;
 
@@ -173,6 +194,11 @@ art_scheduler_loop(ARTScheduler *sched) {
 
         case ART_CO_POLL_IO:
         {
+            LOG_INFO(
+                "[coro.id=%" PRIuMAX "] fd(%d) POLL_IO\n",
+                coro->id,
+                coro_res.d.io.fd
+            );
             if (coro_res.d.io.kind == ART_IO_REGISTERED) {
                 LOG_INFO(
                     "[coro.id=%" PRIuMAX "] fd(%d) ART_IO_REGISTERED\n",
@@ -181,12 +207,17 @@ art_scheduler_loop(ARTScheduler *sched) {
                 );
                 goto schedule_io;
             }
+
             struct epoll_event ev;
+            /*
+             * As background information: The way edge-triggering works is that you keep your socket in the set all the time (so there's no race against epoll_add). The simplest example is a socket where you have a lot of data you want to write, but it could get filled up; you write until the socket buffer is full and get EAGAIN (now the level is low), and then you know that you will get a wakeup through epoll when there's room the next time (the level goes from low to high). With level-triggering, you would have to take the socket in and out of the epoll set all the time, so edge-triggering is more efficient. (But you have to be really careful never to forget about the socket in the high-level state, since you won't ever get any wakeups for it then!) A similar pattern exists for reads, where you could need to pause reading due to your own buffers getting full.
+             */
             ev.events |= EPOLLET;
             ev.events |= coro_res.d.io.kind & ART_IO_READ ? EPOLLIN : 0;
             ev.events |= coro_res.d.io.kind & ART_IO_WRITE ? EPOLLOUT : 0;
             ev.events |= coro_res.d.io.once ? EPOLLONESHOT : 0;
             ev.data.ptr = coro;
+
             int rv = epoll_ctl(
                 sched->epoll_fd, EPOLL_CTL_ADD, coro_res.d.io.fd, &ev
             );
@@ -202,17 +233,27 @@ art_scheduler_loop(ARTScheduler *sched) {
             } else {
                 sched->_fd_bitset |= (1 << coro_res.d.io.fd);
             }
+
 schedule_io:
+            LOG_INFO("[coro.id=%" PRIuMAX "] waiting for io...\n", coro->id);
             art_coro_deque_push_back(&sched->io_q, coro);
         } break;
 
         case ART_CO_RUNNING:
+            // LOG_INFO("[coro.id=%" PRIuMAX "] RUNNING, stage=%" PRIuMAX "\n", coro->id, coro->stage);
             art_coro_deque_push_back(buffer_q, coro);
             break;
         }
 
 poll_events:
-        if (queues_swapped && sched->io_q.first != NULL) {
+        LOG_INFO(
+            "queues_swapped=%d, coro=%p, sched->io_q.first=%p\n",
+            queues_swapped,
+            (void *)coro,
+            (void *)sched->io_q.first
+        );
+        if ((queues_swapped || coro == NULL) && sched->io_q.first != NULL) {
+            LOG_INFO("[id=%" PRIuMAX "] epoll_wait\n", sched - sched->ctx->scheds_items);
             int count = epoll_wait(
                 sched->epoll_fd,
                 sched->epoll_evs_items,
@@ -230,10 +271,6 @@ poll_events:
             }
             for (int i = 0; i < count; i++) {
                 struct epoll_event *ev = &sched->epoll_evs_items[i];
-                // if (ev->data.fd == sched->ctx->global_q.eventfd) {
-                //     global_queue_ready = true;
-                //     continue;
-                // }
                 ARTCoro *coro = ev->data.ptr;
                 LOG_INFO(
                     "[id=%" PRIuMAX "] Received io event for coroutine (id=%"
@@ -244,11 +281,11 @@ poll_events:
                 art_coro_deque_pluck(&sched->io_q, coro);
                 art_coro_deque_push_back(buffer_q, coro);
             }
+            // continue;
         }
 
         if (global_queue_ready) {
-            // char _b[sizeof(uint64_t)];
-            // read(sched->ctx->global_q.eventfd, _b, sizeof(_b));
+            LOG_INFO("[id=%" PRIuMAX "] FETCH_BATCH\n", sched - sched->ctx->scheds_items);
             art_coro_gqueue_lock(&sched->ctx->global_q);
             size_t count = 0;
             for (;;) {
@@ -257,12 +294,22 @@ poll_events:
                     buffer_q,
                     PIPE_BATCH_SIZE
                 );
+                LOG_INFO(
+                    "[id=%" PRIuMAX "] count=%" PRIuMAX", io_q.first=%p, buffer_q.first=%p\n",
+                    sched - sched->ctx->scheds_items,
+                    // (void *)coro,
+                    count,
+                    (void *)sched->io_q.first,
+                    (void *)buffer_q->first
+                );
                 if (
                     coro == NULL
                     && count == 0
                     && sched->io_q.first == NULL
-                    && sched->wait_q.first == NULL
+                    && buffer_q->first == NULL
+                    // && sched->wait_q.first == NULL
                 ) {
+                    LOG_INFO("[id=%" PRIuMAX "] WAIT\n", sched - sched->ctx->scheds_items);
                     art_coro_gqueue_wait(&sched->ctx->global_q);
                     continue;
                 }
