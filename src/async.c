@@ -42,6 +42,7 @@ art_context_init(ARTContext *ctx, ARTContextSettings const *settings) {
         &ctx->cleanups.lock,
         PTHREAD_PROCESS_PRIVATE
     );
+    ctx->n_active_sched = ctx->scheds_size;
 
     LOG_INFO(
         "Context initialized (%" PRIuMAX " schedulers)\n",
@@ -91,7 +92,9 @@ art_context_join(ARTContext *ctx) {
     if (pthread_equal(ctx->main_thread_id, ctx->scheds_items[0].thread_id)) {
         art_scheduler_loop(&ctx->scheds_items[0]);
     } else {
-        pthread_join(ctx->scheds_items[0].thread_id, NULL);
+        for (size_t i = 0; i < ctx->scheds_size; i++) {
+            pthread_join(ctx->scheds_items[i].thread_id, NULL);
+        }
     }
 }
 
@@ -114,7 +117,7 @@ art_context_cleanup(ARTContext *ctx) {
 void
 art_scheduler_init(ARTContext *ctx, ARTScheduler *sched) {
     sched->ctx = ctx;
-    art_coro_deque_init(&sched->wait_q);
+    art_coro_deque_init(&sched->recv_l);
     art_coro_deque_init(&sched->io_q);
     art_coro_deque_init(&sched->active_qs[0]);
     art_coro_deque_init(&sched->active_qs[1]);
@@ -148,6 +151,9 @@ art_scheduler_loop(ARTScheduler *sched) {
 
     for (;;) {
         pthread_testcancel();
+        if (atomic_load(&sched->ctx->n_active_sched) == 0) {
+            break;
+        }
         ARTCoroDeque *active_q;
         ARTCoroDeque *buffer_q;
         ARTCoro *coro;
@@ -210,7 +216,7 @@ art_scheduler_loop(ARTScheduler *sched) {
 
             struct epoll_event ev;
             /*
-             * As background information: The way edge-triggering works is that you keep your socket in the set all the time (so there's no race against epoll_add). The simplest example is a socket where you have a lot of data you want to write, but it could get filled up; you write until the socket buffer is full and get EAGAIN (now the level is low), and then you know that you will get a wakeup through epoll when there's room the next time (the level goes from low to high). With level-triggering, you would have to take the socket in and out of the epoll set all the time, so edge-triggering is more efficient. (But you have to be really careful never to forget about the socket in the high-level state, since you won't ever get any wakeups for it then!) A similar pattern exists for reads, where you could need to pause reading due to your own buffers getting full.
+             * NOTE: As background information: The way edge-triggering works is that you keep your socket in the set all the time (so there's no race against epoll_add). The simplest example is a socket where you have a lot of data you want to write, but it could get filled up; you write until the socket buffer is full and get EAGAIN (now the level is low), and then you know that you will get a wakeup through epoll when there's room the next time (the level goes from low to high). With level-triggering, you would have to take the socket in and out of the epoll set all the time, so edge-triggering is more efficient. (But you have to be really careful never to forget about the socket in the high-level state, since you won't ever get any wakeups for it then!) A similar pattern exists for reads, where you could need to pause reading due to your own buffers getting full.
              */
             ev.events |= EPOLLET;
             ev.events |= coro_res.d.io.kind & ART_IO_READ ? EPOLLIN : 0;
@@ -242,6 +248,12 @@ schedule_io:
         case ART_CO_RUNNING:
             // LOG_INFO("[coro.id=%" PRIuMAX "] RUNNING, stage=%" PRIuMAX "\n", coro->id, coro->stage);
             art_coro_deque_push_back(buffer_q, coro);
+            break;
+
+        case ART_CO_CHAN_SEND:
+            break;
+
+        case ART_CO_CHAN_RECV:
             break;
         }
 
@@ -286,8 +298,8 @@ poll_events:
 
         if (global_queue_ready) {
             LOG_INFO("[id=%" PRIuMAX "] FETCH_BATCH\n", sched - sched->ctx->scheds_items);
-            art_coro_gqueue_lock(&sched->ctx->global_q);
             size_t count = 0;
+            art_coro_gqueue_lock(&sched->ctx->global_q);
             for (;;) {
                 count = art_coro_gqueue_fetch_batch(
                     &sched->ctx->global_q,
@@ -295,7 +307,8 @@ poll_events:
                     PIPE_BATCH_SIZE
                 );
                 LOG_INFO(
-                    "[id=%" PRIuMAX "] count=%" PRIuMAX", io_q.first=%p, buffer_q.first=%p\n",
+                    "[id=%" PRIuMAX "] count=%" PRIuMAX
+                    ", io_q.first=%p, buffer_q.first=%p\n",
                     sched - sched->ctx->scheds_items,
                     // (void *)coro,
                     count,
@@ -303,11 +316,28 @@ poll_events:
                     (void *)buffer_q->first
                 );
                 if (
+                    sched->working
+                    && count == 0
+                    && sched->io_q.first == NULL
+                    && sched->recv_l.first == NULL
+                    && active_q->first == NULL
+                    && buffer_q->first == NULL
+                ) {
+                    sched->working = false;
+                    atomic_fetch_sub(&sched->ctx->n_active_sched, 1);
+                    // We manually trigger other schedulers that might have
+                    // gone to sleep waiting for new tasks. Maybe we don't need
+                    // this, idk
+                    pthread_cond_broadcast(&sched->ctx->global_q.cond);
+                    break;
+                }
+
+                if (
                     coro == NULL
                     && count == 0
                     && sched->io_q.first == NULL
                     && buffer_q->first == NULL
-                    // && sched->wait_q.first == NULL
+                    // && sched->recv_l.first == NULL
                 ) {
                     LOG_INFO("[id=%" PRIuMAX "] WAIT\n", sched - sched->ctx->scheds_items);
                     art_coro_gqueue_wait(&sched->ctx->global_q);
@@ -370,13 +400,13 @@ art_scheduler_cleanup(ARTScheduler *sched) {
     art_coro_deque_cleanup(&sched->io_q);
 
     for (
-        ARTCoro *coro = sched->wait_q.first;
+        ARTCoro *coro = sched->recv_l.first;
         coro != NULL;
         coro = DOUBLE_LIST_NEXT(coro,)
     ) {
         art_coro_cleanup(coro);
     }
-    art_coro_deque_cleanup(&sched->wait_q);
+    art_coro_deque_cleanup(&sched->recv_l);
 
     for (
         ARTCoro *coro = sched->active_qs[0].first;

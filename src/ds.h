@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <stddef.h>
 
 typedef void *OpaqueMemory;
 
@@ -18,6 +19,10 @@ typedef void *OpaqueMemory;
 #define DARRAY_PARTS(PREFIX, TYPE)      \
     ARRAY_PARTS(PREFIX, TYPE);          \
     size_t PREFIX##capacity
+
+#define DEQUE_PARTS(PREFIX, TYPE)       \
+    TYPE *PREFIX##first;                \
+    TYPE *PREFIX##last
 
 #define ATOMIC_RC_PARTS(PREFIX) \
     atomic_uint_fast32_t  PREFIX##refcount
@@ -62,6 +67,23 @@ typedef void *OpaqueMemory;
         sizeof(TYPE)                    \
     ))
 
+#define DEQUE_PUSH_BACK(X, PREFIX, ITEM, ITEM_PREFIX, TYPE)     \
+    art_ds_deque_push_back(                                     \
+        (void **)&(X)->PREFIX##first,                           \
+        (void **)&(X)->PREFIX##last,                            \
+        ITEM,                                                   \
+        offsetof(TYPE, ITEM_PREFIX##prev),                      \
+        offsetof(TYPE, ITEM_PREFIX##next)                       \
+    )
+
+#define DEQUE_POP_FRONT(X, PREFIX, ITEM_PREFIX, TYPE)           \
+    art_ds_deque_pop_front(                                     \
+        (void **)&(X)->PREFIX##first,                           \
+        (void **)&(X)->PREFIX##last,                            \
+        offsetof(TYPE, ITEM_PREFIX##prev),                      \
+        offsetof(TYPE, ITEM_PREFIX##next)                       \
+    )
+
 int
 art_ds_darray_init(
     void **items_p,
@@ -89,6 +111,23 @@ art_ds_darray_push(
     size_t *size,
     size_t *capacity,
     size_t element_size
+);
+
+void
+art_ds_deque_push_back(
+    void **first,
+    void **last,
+    void *item,
+    ptrdiff_t prev_offset,
+    ptrdiff_t next_offset
+);
+
+void *
+art_ds_deque_pop_front(
+    void **first,
+    void **last,
+    ptrdiff_t prev_offset,
+    ptrdiff_t next_offset
 );
 
 uint32_t

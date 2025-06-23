@@ -2,11 +2,13 @@
 #define ART_QUEUES_H
 #include <pthread.h>
 #include <sys/eventfd.h>
+#include "ds.h"
 #include "coro.h"
 
 typedef struct art_coro_gqueue_t {
-    ARTCoro *first;
-    ARTCoro *last;
+    // ARTCoro *first;
+    // ARTCoro *last;
+    DEQUE_PARTS(, ARTCoro);
 
     pthread_mutex_t mtx;
     pthread_cond_t cond;

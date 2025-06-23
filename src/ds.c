@@ -51,6 +51,49 @@ art_ds_darray_push(
     return data[(*size)++ * element_size];
 }
 
+void
+art_ds_deque_push_back(
+    void **first_p,
+    void **last_p,
+    void *item,
+    ptrdiff_t prev_offset,
+    ptrdiff_t next_offset
+) {
+    if (*first_p == NULL) {
+        *first_p = item;
+        *last_p = item;
+    } else {
+        void **prev_p = (void **)((uint8_t *)item + prev_offset);
+        void **last_next_p = (void **)((uint8_t *)*last_p + next_offset);
+        *last_next_p = item;
+        *prev_p = *last_p;
+        *last_p = item;
+    }
+}
+
+void *
+art_ds_deque_pop_front(
+    void **first_p,
+    void **last_p,
+    ptrdiff_t prev_offset,
+    ptrdiff_t next_offset
+) {
+    void *item = *first_p;
+    if (item == NULL) {
+        return NULL;
+    }
+    void **next_p = (void **)((uint8_t *)item + next_offset);
+    *first_p = *next_p;
+    if (*last_p == item) {
+        *last_p = NULL;
+    } else {
+        void **prev_p = (void **)((uint8_t *)*next_p + prev_offset);
+        *prev_p = NULL;
+    }
+    *next_p = NULL;
+    return item;
+}
+
 uint32_t
 art_ds_atomic_ref(atomic_uint_fast32_t *refcount) {
     return atomic_fetch_add_explicit(refcount, 1, memory_order_relaxed);

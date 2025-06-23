@@ -117,14 +117,7 @@ art_coro_deque_init(ARTCoroDeque *deque) {
 
 void
 art_coro_deque_push_back(ARTCoroDeque *deque, ARTCoro *coro) {
-    coro->prev = deque->last;
-    coro->next = NULL;
-    if (deque->last != NULL) {
-        deque->last->next = coro;
-    } else {
-        deque->first = coro;
-    }
-    deque->last = coro;
+    DEQUE_PUSH_BACK(deque, , coro, , ARTCoro);
 }
 
 void
@@ -136,21 +129,7 @@ art_coro_deque_push_back_lock(ARTCoroDeque *deque, ARTCoro *coro) {
 
 ARTCoro *
 art_coro_deque_pop_front(ARTCoroDeque *deque) {
-    ARTCoro *coro = NULL;
-    if (deque->first == NULL) {
-        goto end;
-    }
-    coro = deque->first;
-    if (deque->last == coro) {
-        deque->last = NULL;
-    }
-    else {
-        coro->next->prev = coro->prev;
-    }
-    deque->first = coro->next;
-    coro->next = NULL;
-end:
-    return coro;
+    return DEQUE_POP_FRONT(deque, , , ARTCoro);
 }
 
 ARTCoro *

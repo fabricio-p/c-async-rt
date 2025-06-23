@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "ds.h"
 
+struct art_chan_t;
 struct art_scheduler_t;
 
 typedef enum coroutine_status_t {
@@ -10,6 +11,8 @@ typedef enum coroutine_status_t {
     ART_CO_INITIALIZED,
     ART_CO_RUNNING,
     ART_CO_POLL_IO,
+    ART_CO_CHAN_SEND,
+    ART_CO_CHAN_RECV
 } ARTCoroStatus;
 
 typedef enum coroutine_io_kind_t {
@@ -27,6 +30,14 @@ typedef struct coroutine_result_t {
             ARTCoroIOKind kind;
             bool once;
         } io;
+        struct {
+            void const *data;
+            struct art_chan_t *chan;
+        } chan_send;
+        struct {
+            void *data;
+            struct art_chan_t *chan;
+        } chan_recv;
     } d;
 } ARTCoroResult;
 
@@ -140,6 +151,17 @@ enum {
         .d.io.fd = -1,                                                      \
         .d.io.kind = ART_IO_REGISTERED                                      \
     }
+
+#define ART_CO_CHAN_STAGE(stage_, action_, chan_, data_)                    \
+    return (ARTCoroResult) {                                                \
+        .status = ART_CO_CHAN_##action_,                                    \
+        .stage = stage_,                                                    \
+        .d.chan = {                                                         \
+            .chan = chan_,                                                  \
+            .data = data_                                                   \
+        }                                                                   \
+    }                                                                       \
+    ART_CO_STAGE(stage_)
 
 /*#define ART_CO_POLL_IO_LOOP_BREAK(stage_, action_, ...)                      \
     ART_CO_STAGE(stage_);                                                   \
